@@ -1266,6 +1266,31 @@ parser.add_argument('--v8-enable-short-builtin-calls',
     help='Enable V8 short builtin calls support. This feature is enabled '+
          'on x86_64 platform by default.')
 
+parser.add_argument('--v8-enable-builtins-profiling',
+    action='store_true',
+    dest='v8_enable_builtins_profiling',
+    default=None,
+    help='Instrument V8\'s builtins with basic-block counters, to record a '
+         'profile for --v8-builtins-profile. Run the workload with '
+         'NODE_V8_FLAGS=--turbo-profiling-output=<file> (a %%p in <file> '
+         'becomes the process id). The counters make builtins slower.')
+
+parser.add_argument('--v8-builtins-profile',
+    action='store',
+    dest='v8_builtins_profile',
+    default=None,
+    help='Optimize V8\'s builtins with this profile (branch hints and block '
+         'counts, see tools/v8_builtins_pgo.py). It must come from a build '
+         'with the same V8 and configuration; builtins whose code changed '
+         'since are listed in the build log and built without it.')
+
+parser.add_argument('--v8-disable-builtins-reordering',
+    action='store_true',
+    dest='v8_disable_builtins_reordering',
+    default=None,
+    help='With --v8-builtins-profile, keep the default order of the builtins '
+         'in the embedded blob instead of ordering them by the profile.')
+
 parser.add_argument('--v8-enable-snapshot-compression',
     action='store_true',
     dest='v8_enable_snapshot_compression',
@@ -2296,6 +2321,17 @@ def configure_v8(o, configs):
     o['variables']['v8_enable_short_builtin_calls'] = 1
   if options.v8_enable_snapshot_compression:
     o['variables']['v8_enable_snapshot_compression'] = 1
+  if options.v8_enable_builtins_profiling and options.v8_builtins_profile:
+    raise Exception(
+        '--v8-enable-builtins-profiling and --v8-builtins-profile cannot be '
+        'used together.')
+  o['variables']['v8_enable_builtins_profiling'] = B(options.v8_enable_builtins_profiling)
+  if options.v8_builtins_profile:
+    profile = os.path.abspath(options.v8_builtins_profile)
+    if not os.path.isfile(profile):
+      raise Exception(f'--v8-builtins-profile: {profile} does not exist.')
+    o['variables']['v8_builtins_profiling_log_file'] = profile
+  o['variables']['v8_enable_builtins_reordering'] = B(not options.v8_disable_builtins_reordering)
   if all(opt in sys.argv for opt in ['--v8-enable-object-print', '--v8-disable-object-print']):
     raise Exception(
         'Only one of the --v8-enable-object-print or --v8-disable-object-print options '

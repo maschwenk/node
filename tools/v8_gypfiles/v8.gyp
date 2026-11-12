@@ -459,7 +459,9 @@
                 'mksnapshot_flags': ['--code-comments'],
               },
             }],
-            ['v8_enable_concurrent_mksnapshot == 1', {
+            # --turbo-profiling and --reorder-builtins turn concurrent builtin
+            # generation off; don't ask for it in those builds.
+            ['v8_enable_concurrent_mksnapshot == 1 and v8_enable_builtins_profiling == 0 and (v8_builtins_profiling_log_file == "" or v8_enable_builtins_reordering == 0)', {
               'variables': {
                 'mksnapshot_flags': [
                   '--concurrent-builtin-generation',
@@ -467,6 +469,31 @@
                   '--concurrent-turbofan-max-threads=0',
                 ],
               },
+            }],
+            ['v8_enable_builtins_profiling == 1', {
+              'variables': {
+                'mksnapshot_flags': ['--turbo-profiling'],
+              },
+            }],
+            # The profile is not listed in 'inputs': the action passes every
+            # input to mksnapshot as a script to embed. mksnapshot reruns
+            # when the path changes, not when the file at the same path does.
+            ['v8_builtins_profiling_log_file != ""', {
+              'variables': {
+                'mksnapshot_flags': [
+                  '--turbo-profiling-input', '<(v8_builtins_profiling_log_file)',
+                  # List the builtins whose profile no longer matches their
+                  # code (it is ignored for those) instead of failing the build.
+                  '--warn-about-builtin-profile-data',
+                ],
+              },
+              'conditions': [
+                ['v8_enable_builtins_profiling == 0 and v8_enable_builtins_reordering == 1', {
+                  'variables': {
+                    'mksnapshot_flags': ['--reorder-builtins'],
+                  },
+                }],
+              ],
             }],
             ['v8_enable_snapshot_native_code_counters', {
               'variables': {
