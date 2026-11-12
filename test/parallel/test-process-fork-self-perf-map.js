@@ -1,4 +1,3 @@
-// Flags: --perf-basic-prof
 'use strict';
 
 // With --perf-basic-prof, a child of process.forkSelf() writes its own
@@ -13,7 +12,20 @@ if (!common.isLinux) common.skip('--perf-basic-prof is Linux only');
 
 const assert = require('assert');
 const fs = require('fs');
+const { spawnSync } = require('child_process');
 const { forkChild, expectCleanExit } = require('../common/fork-self');
+
+if (process.argv[2] !== 'child') {
+  // --perf-basic-prof also writes V8's code log to the working directory.
+  const tmpdir = require('../common/tmpdir');
+  tmpdir.refresh();
+  const r = spawnSync(process.execPath,
+                      ['--perf-basic-prof', __filename, 'child'],
+                      { cwd: tmpdir.path, stdio: 'inherit' });
+  assert.strictEqual(r.signal, null);
+  assert.strictEqual(r.status, 0);
+  return;
+}
 
 function hot(name) {
   // eslint-disable-next-line no-new-func
