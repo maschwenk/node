@@ -302,6 +302,7 @@ CompileCacheEntry* CompileCacheHandler::GetOrInsert(Local<String> code,
   result->source_filename = filename_utf8.ToString();
   result->cache = nullptr;
   result->type = type;
+  result->consumed = false;
 
   // TODO(joyeecheung): if we fail enough times, stop trying for any future
   // files.
@@ -330,7 +331,18 @@ void CompileCacheHandler::MaybeSaveImpl(CompileCacheEntry* entry,
         : (entry->cache == nullptr) ? "not initialized"
                                     : "accepted");
   if (entry->cache != nullptr && !rejected) {  // accepted
-    Debug("keeping the in-memory entry\n");
+    // V8 has deserialized its own copy (see CopyCache()) and the cache on
+    // disk is up to date, so the buffer is not needed anymore. Keeping it
+    // until exit costs as much memory as all the caches the process read.
+    Debug("keeping the in-memory entry, releasing its buffer\n");
+    entry->cache.reset();
+    entry->consumed = true;
+    return;
+  }
+  if (entry->consumed && !rejected) {
+    // Compiled again in this process (e.g. after being removed from
+    // require.cache): the cache on disk is already up to date.
+    Debug("already consumed from disk, not serializing\n");
     return;
   }
   if (read_only_) {
@@ -414,10 +426,11 @@ void CompileCacheHandler::Persist() {
     auto* entry = pair.second.get();
     const char* type_name = entry->type_name();
     if (entry->cache == nullptr) {
-      Debug("[compile cache] skip persisting %s %s because the cache was not "
-            "initialized\n",
+      Debug("[compile cache] skip persisting %s %s because %s\n",
             type_name,
-            entry->source_filename);
+            entry->source_filename,
+            entry->consumed ? "cache was the same"
+                            : "the cache was not initialized");
       continue;
     }
     if (entry->refreshed == false) {
