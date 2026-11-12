@@ -279,7 +279,6 @@ int ProtectionFor(v8::PageAllocator::Permission permission) {
 void AdviseRange(uintptr_t start, size_t size) {
   void* address = reinterpret_cast<void*>(start);
   madvise(address, size, MADV_HUGEPAGE);
-  madvise(address, size, MADV_DONTFORK);
 }
 
 // Replaces [start, start + size) with a fresh read-write mapping. Unlike
