@@ -875,12 +875,29 @@ Enable the
 .Sy module compile cache
 for the Node.js instance.
 .
+.It Ev NODE_COMPILE_CACHE_CAPTURE Ar compile
+When set to 'compile', the
+.Sy module compile cache
+produces the code cache of a module right after it is compiled instead of after it ran.
+The cache then only holds the module's top-level code.
+.
+.It Ev NODE_COMPILE_CACHE_CHECKPOINT_GCS Ar n
+The number of major garbage collections after which a module's code cache is produced
+and written to disk while the process is still running (default: 2). 0 turns this off.
+.
 .It Ev NODE_COMPILE_CACHE_PORTABLE
 When set to '1' or 'true', the
 .Sy module compile cache
 will be hit as long as the location of the modules relative to the cache directory remain
 consistent. This can be used in conjunction with .Ev NODE_COMPILE_CACHE
 to enable portable on-disk caching.
+.
+.It Ev NODE_COMPILE_CACHE_REFRESH Ar n
+For modules whose cache was read from disk and accepted, the
+.Sy module compile cache
+produces a new code cache after execution for a different one in n of them per process
+(default: 8), so caches grow when later runs exercise more code. 1 does it for every module,
+0 turns it off.
 .
 .It Ev NODE_DEBUG Ar modules...
 Comma-separated list of core modules that should print debug information.
