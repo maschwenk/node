@@ -298,7 +298,13 @@ CompileCacheEntry* CompileCacheHandler::GetOrInsert(const uint8_t* code,
   // TODO(joyeecheung): let V8's in-isolate compilation cache take precedence.
   if (loaded != compiler_cache_store_.end() &&
       loaded->second->code_hash == code_hash) {
-    return loaded->second.get();
+    CompileCacheEntry* entry = loaded->second.get();
+    // Compiled again, e.g. after being deleted from require.cache. The buffer
+    // of a cache that V8 consumed was released, so read the file again.
+    if (entry->consumed && entry->cache == nullptr) {
+      ReadCacheFile(entry);
+    }
+    return entry;
   }
 
   // If the code hash mismatches, the code has changed, discard the stale entry
@@ -315,6 +321,7 @@ CompileCacheEntry* CompileCacheHandler::GetOrInsert(const uint8_t* code,
   result->source_filename = filename_utf8.ToString();
   result->cache = nullptr;
   result->type = type;
+  result->consumed = false;
 
   // TODO(joyeecheung): if we fail enough times, stop trying for any future
   // files.
@@ -355,7 +362,17 @@ void CompileCacheHandler::MaybeSaveImpl(CompileCacheEntry* entry,
         : (entry->cache == nullptr) ? "not initialized"
                                     : "accepted");
   if (entry->cache != nullptr && !rejected) {  // accepted
-    Debug("keeping the in-memory entry\n");
+    if (!entry->refreshed) {
+      // The cache was read from disk and V8 has deserialized its own copy
+      // (see CopyCache()), so release the buffer instead of keeping the caches
+      // of all the modules the process loaded in memory until it exits.
+      Debug("keeping the in-memory entry, releasing its buffer\n");
+      entry->cache.reset();
+      entry->consumed = true;
+    } else {
+      // Produced by this process and not written yet.
+      Debug("keeping the in-memory entry\n");
+    }
     return;
   }
   if (read_only_) {
@@ -452,10 +469,11 @@ void CompileCacheHandler::Persist() {
     auto* entry = pair.second.get();
     const char* type_name = entry->type_name();
     if (entry->cache == nullptr) {
-      Debug("[compile cache] skip persisting %s %s because the cache was not "
-            "initialized\n",
+      Debug("[compile cache] skip persisting %s %s because %s\n",
             type_name,
-            entry->source_filename);
+            entry->source_filename,
+            entry->consumed ? "cache was the same"
+                            : "the cache was not initialized");
       continue;
     }
     if (entry->refreshed == false) {
