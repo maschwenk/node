@@ -38,6 +38,8 @@ struct CompileCacheEntry {
   CachedCodeType type;
   bool refreshed = false;
   bool persisted = false;
+  // The cache read from disk was accepted by V8 and its buffer released.
+  bool consumed = false;
 
   // Copy the cache into a new store for V8 to consume. Caller takes
   // ownership.
