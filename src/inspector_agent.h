@@ -170,6 +170,14 @@ class Agent {
   std::shared_ptr<NetworkResourceManager> network_resource_manager_;
 };
 
+#ifdef __POSIX__
+// fork(2) support for the per-process SIGUSR1 watchdog thread: call
+// PrepareForFork() right before fork() and AfterFork() right after it, in
+// both processes. The child gets a new watchdog thread.
+void PrepareForFork();
+void AfterFork(bool in_child);
+#endif  // __POSIX__
+
 }  // namespace inspector
 }  // namespace node
 

@@ -183,6 +183,9 @@ class SigintWatchdogHelper {
 
   int Start();
   bool Stop();
+  // Whether the helper thread (POSIX) runs: between the first Start() and
+  // the matching Stop(). process.forkSelf() refuses to fork then.
+  bool IsRunning();
 
  private:
   SigintWatchdogHelper();

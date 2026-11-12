@@ -36,6 +36,16 @@ class Agent {
   // Returns a comma-separated list of enabled categories.
   virtual std::string GetEnabledCategories() const = 0;
 
+  // Whether the agent's writer thread runs (it does from the first enabled
+  // client until StopTracing()). process.forkSelf() refuses to fork then.
+  virtual bool IsThreadRunning() const { return false; }
+
+  // process.forkSelf(), in the child, while the thread does not run: gives
+  // the agent's event loop its own epoll/io_uring instances (uv_loop_fork()).
+  // The loop exists in every process and runs once more at exit; the child
+  // must not share its kernel state with the parent and its other children.
+  virtual void ReinitializeLoopAfterFork() {}
+
   // Called by V8Platform to start/stop file-based tracing.
   virtual void StartTracing(const std::string& categories) = 0;
   virtual void StopTracing() = 0;
