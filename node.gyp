@@ -149,6 +149,7 @@
       'src/node_options.cc',
       'src/node_os.cc',
       'src/node_perf.cc',
+      'src/node_heap_page_allocator.cc',
       'src/node_platform.cc',
       'src/node_profiling.cc',
       'src/node_postmortem_metadata.cc',
@@ -282,6 +283,7 @@
       'src/node_options-inl.h',
       'src/node_perf.h',
       'src/node_perf_common.h',
+      'src/node_heap_page_allocator.h',
       'src/node_platform.h',
       'src/node_profiling.h',
       'src/node_process.h',
@@ -849,7 +851,8 @@
       'include_dirs': [
         'src',
         'deps/postject',
-        '<(SHARED_INTERMEDIATE_DIR)' # for node_natives.h
+        '<(SHARED_INTERMEDIATE_DIR)', # for node_natives.h
+        'deps/v8', # for src/base/page-allocator.h
       ],
       'dependencies': [
         'node_js2c#host',
