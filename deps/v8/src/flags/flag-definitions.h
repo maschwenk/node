@@ -2655,6 +2655,10 @@ DEFINE_BOOL(stress_per_context_marking_worklist, false,
 DEFINE_BOOL(stress_incremental_marking, false,
             "force incremental marking for small heaps and run it more often")
 
+DEFINE_BOOL(large_objects_at_cage_top, false,
+            "allocate large object pages from the top of the pointer "
+            "compression cage, apart from regular pages, which fill it from "
+            "the bottom")
 DEFINE_BOOL(memory_pool, true,
             "Pool memory globally before returning it to the operating system")
 DEFINE_BOOL(

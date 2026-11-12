@@ -20,6 +20,7 @@
 #include "src/heap/mutable-page.h"
 #include "src/heap/read-only-spaces.h"
 #include "src/heap/zapping.h"
+#include "src/init/isolate-group.h"
 #include "src/logging/log.h"
 #include "src/sandbox/hardware-support.h"
 #include "src/utils/allocation.h"
@@ -118,6 +119,31 @@ Address MemoryAllocator::AllocateAlignedMemory(
   PageAllocator::Permission permissions =
       executable == EXECUTABLE ? MutablePage::GetCodeModificationPermission()
                                : PageAllocator::kReadWrite;
+
+#ifdef V8_COMPRESS_POINTERS
+  // Large objects from the top of the cage, so they do not share memory
+  // ranges with regular pages (lets an embedder's page allocator treat the
+  // two kinds of memory differently, e.g. back only pages with huge pages).
+  if (v8_flags.large_objects_at_cage_top && page_size == PageSize::kLarge &&
+      executable == NOT_EXECUTABLE && !hint.MayGrow() &&
+      address_hint == nullptr) {
+    VirtualMemoryCage* cage = isolate_->isolate_group()->GetPtrComprCage();
+    if (cage != nullptr && page_allocator == cage->page_allocator() &&
+        alignment <= cage->page_allocator()->AllocatePageSize()) {
+      base::BoundedPageAllocator* bounded = cage->page_allocator();
+      size_t size = RoundUp(chunk_size, bounded->AllocatePageSize());
+      void* ptr = bounded->AllocatePagesFromTop(size, permissions);
+      if (ptr != nullptr) {
+        VirtualMemory top(page_allocator, reinterpret_cast<Address>(ptr),
+                          size);
+        Address base = top.address();
+        UpdateAllocatedSpaceLimits(base, base + chunk_size, executable);
+        *controller = std::move(top);
+        return base;
+      }
+    }
+  }
+#endif  // V8_COMPRESS_POINTERS
 
   v8::PageAllocator::AllocationHint page_allocation_hint =
       v8::PageAllocator::AllocationHint().WithAddress(address_hint);
