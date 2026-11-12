@@ -1417,6 +1417,33 @@ An invalid pointer was passed to an FFI operation.
 
 An operation was attempted on an FFI dynamic library after it was closed.
 
+<a id="ERR_FORK_SELF_BUSY"></a>
+
+### `ERR_FORK_SELF_BUSY`
+
+<!-- YAML
+added: REPLACEME
+-->
+
+> Stability: 1 - Experimental
+
+[`process.forkSelf()`][] could not fork right now: requests were in flight on
+the event loop, or V8's background threads did not become idle. Calling it
+again once the event loop is idle can succeed.
+
+<a id="ERR_FORK_SELF_UNSAFE"></a>
+
+### `ERR_FORK_SELF_UNSAFE`
+
+<!-- YAML
+added: REPLACEME
+-->
+
+> Stability: 1 - Experimental
+
+[`process.forkSelf()`][] cannot fork this process safely in its current state,
+for example while Worker threads are running or the inspector is listening.
+
 <a id="ERR_FS_CP_DIR_TO_NON_DIR"></a>
 
 ### `ERR_FS_CP_DIR_TO_NON_DIR`
@@ -4843,3 +4870,4 @@ An error occurred trying to allocate memory. This should never happen.
 [try-catch]: https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Statements/try...catch
 [type-stripping]: typescript.md#type-stripping
 [vm]: vm.md
+[`process.forkSelf()`]: process.md#processforkselfoptions
