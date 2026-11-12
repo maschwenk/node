@@ -6459,7 +6459,10 @@ void Isolate::DumpAndResetBuiltinsProfileData() {
     if (v8_flags.turbo_profiling_output) {
       // Append: a process may dump more than once (on exit and at teardown),
       // and get_hints.py sums repeated block counts.
-      FILE* f = std::fopen(v8_flags.turbo_profiling_output, "a");
+      // One file per isolate: worker threads dump concurrently.
+      std::string path = std::string(v8_flags.turbo_profiling_output.value()) +
+                         "." + std::to_string(id());
+      FILE* f = std::fopen(path.c_str(), "a");
       if (f == nullptr) {
         FATAL("Unable to open file \"%s\" for writing.\n",
               v8_flags.turbo_profiling_output.value());
