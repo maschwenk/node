@@ -468,6 +468,21 @@
                 ],
               },
             }],
+            ['v8_enable_builtins_profiling==1', {
+              'variables': {
+                'mksnapshot_flags': ['--turbo-profiling'],
+              },
+            }],
+            ['v8_builtins_profiling_log_file!=""', {
+              # Not in 'inputs': this action passes its inputs to mksnapshot as
+              # positional arguments (the script to embed).
+              'variables': {
+                'mksnapshot_flags': [
+                  '--turbo-profiling-input', '<(v8_builtins_profiling_log_file)',
+                  '--warn-about-builtin-profile-data',
+                ],
+              },
+            }],
             ['v8_enable_snapshot_native_code_counters', {
               'variables': {
                 'mksnapshot_flags': ['--native-code-counters'],
