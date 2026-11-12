@@ -6457,13 +6457,17 @@ void Isolate::DumpAndResetStats() {
 void Isolate::DumpAndResetBuiltinsProfileData() {
   if (BasicBlockProfiler::Get()->HasData(this)) {
     if (v8_flags.turbo_profiling_output) {
-      FILE* f = std::fopen(v8_flags.turbo_profiling_output, "w");
+      // Append: a process may dump more than once (on exit and at teardown),
+      // and get_hints.py sums repeated block counts.
+      FILE* f = std::fopen(v8_flags.turbo_profiling_output, "a");
       if (f == nullptr) {
         FATAL("Unable to open file \"%s\" for writing.\n",
               v8_flags.turbo_profiling_output.value());
       }
       OFStream pgo_stream(f);
       BasicBlockProfiler::Get()->Log(this, pgo_stream);
+      pgo_stream.flush();
+      std::fclose(f);
     } else {
       StdoutStream out;
       BasicBlockProfiler::Get()->Print(this, out);
