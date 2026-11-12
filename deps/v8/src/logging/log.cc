@@ -378,6 +378,13 @@ class PerfBasicLogger : public CodeEventLogger {
 
   static base::LazyRecursiveMutex& GetFileMutex();
 
+ public:
+  // In a child created by fork(2): the open file is the parent's. Copy it
+  // (the code it describes so far is the child's too) to this process's own
+  // perf-<pid>.map and continue there.
+  static void ReopenAfterFork();
+
+ private:
   // Extension added to V8 log file name to get the low-level log name.
   static const char kFilenameFormatString[];
   static const int kFilenameBufferPadding;
@@ -386,6 +393,8 @@ class PerfBasicLogger : public CodeEventLogger {
   // to determine when it goes away, we keep the reference count.
   static FILE* perf_output_handle_;
   static uint64_t reference_count_;
+  // The pid in the name of the file perf_output_handle_ writes to.
+  static int perf_output_pid_;
 };
 
 // Extra space for the "perf-%d.map" filename, including the PID.
@@ -401,6 +410,40 @@ base::LazyRecursiveMutex& PerfBasicLogger::GetFileMutex() {
 // PerfBasicLogger::GetFileMutex().
 uint64_t PerfBasicLogger::reference_count_ = 0;
 FILE* PerfBasicLogger::perf_output_handle_ = nullptr;
+int PerfBasicLogger::perf_output_pid_ = 0;
+
+// static
+void PerfBasicLogger::ReopenAfterFork() {
+  base::LockGuard<base::RecursiveMutex> guard_file(GetFileMutex().Pointer());
+  if (perf_output_handle_ == nullptr) return;
+  const int pid = base::OS::GetCurrentProcessId();
+  if (pid == perf_output_pid_) return;
+  const char* base_dir = v8_flags.perf_basic_prof_path;
+  base::ScopedVector<char> old_name(strlen(base_dir) + kFilenameBufferPadding);
+  base::ScopedVector<char> new_name(strlen(base_dir) + kFilenameBufferPadding);
+  CHECK_NE(SNPrintF(old_name, "%s/perf-%d.map", base_dir, perf_output_pid_),
+           -1);
+  CHECK_NE(SNPrintF(new_name, "%s/perf-%d.map", base_dir, pid), -1);
+  // Everything written before the fork is in the file (it is line buffered;
+  // flush the rest of a partial line, if any).
+  fflush(perf_output_handle_);
+  FILE* out = base::OS::FOpen(new_name.begin(), base::OS::LogFileOpenMode);
+  if (out == nullptr) return;  // Keep writing to the parent's file.
+  if (FILE* in = base::OS::FOpen(old_name.begin(), "r")) {
+    char buffer[64 * 1024];
+    size_t n;
+    while ((n = fread(buffer, 1, sizeof(buffer), in)) > 0) {
+      fwrite(buffer, 1, n, out);
+    }
+    fclose(in);
+  }
+  fclose(perf_output_handle_);
+  perf_output_handle_ = out;
+  perf_output_pid_ = pid;
+  setvbuf(perf_output_handle_, nullptr, _IOLBF, 0);
+}
+
+void ReopenPerfBasicLogAfterFork() { PerfBasicLogger::ReopenAfterFork(); }
 
 PerfBasicLogger::PerfBasicLogger(Isolate* isolate) : CodeEventLogger(isolate) {
   base::LockGuard<base::RecursiveMutex> guard_file(GetFileMutex().Pointer());
@@ -420,6 +463,7 @@ PerfBasicLogger::PerfBasicLogger(Isolate* isolate) : CodeEventLogger(isolate) {
     perf_output_handle_ =
         base::OS::FOpen(perf_dump_name.begin(), base::OS::LogFileOpenMode);
     CHECK_NOT_NULL(perf_output_handle_);
+    perf_output_pid_ = process_id_;
     setvbuf(perf_output_handle_, nullptr, _IOLBF, 0);
   }
 }

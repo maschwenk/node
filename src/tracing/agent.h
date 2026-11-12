@@ -36,6 +36,10 @@ class Agent {
   // Returns a comma-separated list of enabled categories.
   virtual std::string GetEnabledCategories() const = 0;
 
+  // Whether the agent's writer thread runs (it does from the first enabled
+  // client until StopTracing()). process.forkSelf() refuses to fork then.
+  virtual bool IsThreadRunning() const { return false; }
+
   // Called by V8Platform to start/stop file-based tracing.
   virtual void StartTracing(const std::string& categories) = 0;
   virtual void StopTracing() = 0;

@@ -2282,6 +2282,114 @@ function setup() {
 setup();
 ```
 
+## `process.forkSelf([options])`
+
+<!-- YAML
+added: REPLACEME
+-->
+
+> Stability: 1 - Experimental
+
+* `options` {Object}
+  * `onExit` {Function} Called in the parent once the child has exited, with
+    the same arguments as the [`'exit'`][] event of a `ChildProcess`:
+    * `code` {integer|null} The exit code, or `null` if the child was killed
+      by a signal.
+    * `signal` {string|null} The name of the signal that killed the child, or
+      `null`.
+
+    While a child forked with `onExit` is running, it keeps the parent's event
+    loop alive.
+* Returns: {integer} The process id of the child in the parent, and `0` in the
+  child.
+
+Forks the running process with `fork(2)`: the child is a copy of the parent
+with its JavaScript heap, loaded modules, compiled code, timers and other
+handles, and both processes continue by returning from `process.forkSelf()`.
+A process that spends a long time getting ready (loading and compiling many
+modules) can do that once and then fork copies of itself, which share the
+parent's memory until they write to it.
+
+```mjs
+const pid = process.forkSelf({
+  onExit(code, signal) {
+    console.log(`child ${pid} exited with ${code ?? signal}`);
+  },
+});
+if (pid === 0) {
+  // In the child.
+  console.log(`I am ${process.pid}, forked from ${process.ppid}`);
+  process.exit(0);
+}
+```
+
+```cjs
+const pid = process.forkSelf({
+  onExit(code, signal) {
+    console.log(`child ${pid} exited with ${code ?? signal}`);
+  },
+});
+if (pid === 0) {
+  // In the child.
+  console.log(`I am ${process.pid}, forked from ${process.ppid}`);
+  process.exit(0);
+}
+```
+
+Node.js makes the following safe in the child, before `process.forkSelf()`
+returns `0` and before any event loop turn:
+
+* The event loop is reinitialized (`uv_loop_fork()`); timers, file system
+  operations, DNS, `child_process` and network handles work in the child.
+  V8's background threads (garbage collection, compilation) and the libuv
+  thread pool are started again in both processes.
+* `process.pid` is the child's; `process.ppid` is the parent's.
+* The IPC channel inherited from the parent (when the parent was started by
+  [`child_process.fork()`][] or is a [`cluster`][] worker) is closed in the
+  child without emitting `'disconnect'`: `process.connected` is `false` and
+  `process.send()`, `process.disconnect()` and `process.channel` are gone.
+  Messages that the parent had received but not yet emitted are not emitted in
+  the child.
+* Randomness is not shared: `Math.random()` (in every context, unless
+  `--random-seed` is set), [`crypto.randomUUID()`][], [`crypto.randomInt()`][],
+  [`crypto.randomBytes()`][] and other users of OpenSSL's random number
+  generator produce sequences of their own in each child.
+* The parent waits for (reaps) the children it forked, whether or not
+  `onExit` is given.
+
+Everything else is inherited as `fork(2)` inherits it, and is the caller's
+responsibility:
+
+* Handles other than the IPC channel are open in both processes: a server
+  accepts connections in the child too, a socket or `process.stdin` can be
+  read by either process, and ending a shared socket ends it for both. Close
+  in the child what belongs to the parent.
+* Callbacks that were already queued (for example by `process.nextTick()`,
+  promises, or timers) run in both processes. So do `process.on('exit')`
+  listeners; remove the parent's in the child if they must not run there.
+* Values captured before the fork stay the parent's: modules that stored
+  `process.pid` at load time, and entropy pools kept in JavaScript (such as
+  the pool of the `nanoid` package) hand out the same values in every child.
+* `performance.timeOrigin`, `process.uptime()` and `process.hrtime()` continue
+  the parent's clocks.
+* Memory is shared copy-on-write: a child's garbage collections and
+  allocations turn shared pages into private ones over time.
+
+`process.forkSelf()` throws an error with the code
+[`ERR_FORK_SELF_UNSAFE`][] if Worker threads (including the thread of
+off-thread module customization hooks) are running, the inspector is
+listening, trace events are being recorded, a SIGINT watchdog (the REPL,
+`vm` with `breakOnSigint`) is running, or (on Linux) any thread that Node.js
+does not know to be safe to fork is running, such as a native addon's thread.
+It throws [`ERR_FORK_SELF_BUSY`][] if requests are in flight on the event
+loop (file system, DNS, crypto or zlib work, pending writes, connects) or
+if V8's background threads did not become idle; call it again once the event
+loop is idle.
+
+This function is only available on the main thread of a process that owns its
+process state, and not on Windows or IBM i. Test for it with
+`typeof process.forkSelf === 'function'`.
+
 ## `process.getActiveResourcesInfo()`
 
 <!-- YAML
@@ -4719,3 +4827,10 @@ cases:
 [uv_rusage_t]: https://docs.libuv.org/en/v1.x/misc.html#c.uv_rusage_t
 [wikipedia_major_fault]: https://en.wikipedia.org/wiki/Page_fault#Major
 [wikipedia_minor_fault]: https://en.wikipedia.org/wiki/Page_fault#Minor
+[`ERR_FORK_SELF_BUSY`]: errors.md#err_fork_self_busy
+[`ERR_FORK_SELF_UNSAFE`]: errors.md#err_fork_self_unsafe
+[`crypto.randomBytes()`]: crypto.md#cryptorandombytessize-callback
+[`crypto.randomInt()`]: crypto.md#cryptorandomintmin-max-callback
+[`crypto.randomUUID()`]: crypto.md#cryptorandomuuidoptions
+[`child_process.fork()`]: child_process.md#child_processforkmodulepath-args-options
+[`cluster`]: cluster.md

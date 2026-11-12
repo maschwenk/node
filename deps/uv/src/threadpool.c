@@ -256,6 +256,15 @@ static void init_threads(void) {
 static void reset_once(void) {
   uv_once_t child_once = UV_ONCE_INIT;
   memcpy(&once, &child_once, sizeof(child_once));
+  /* The worker threads do not exist in the child. Forget them, or
+   * uv__threadpool_cleanup() (uv_library_shutdown()) would try to join them
+   * and wait forever. The next uv__work_submit() starts new ones. The array is
+   * leaked when it was allocated: it is not safe to call free() here.
+   */
+  threads = NULL;
+  nthreads = 0;
+  idle_threads = 0;
+  slow_io_work_running = 0;
 }
 #endif
 

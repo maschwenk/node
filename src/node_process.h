@@ -106,6 +106,12 @@ class BindingData : public SnapshotableObject {
   static v8::CFunction fast_hrtime_bigint_;
 };
 
+#if defined(__POSIX__) && !defined(__PASE__)
+// process.forkSelf(), see node_process_fork.cc.
+void ForkSelf(const v8::FunctionCallbackInfo<v8::Value>& args);
+void SetForkSelfExitCallback(const v8::FunctionCallbackInfo<v8::Value>& args);
+#endif
+
 }  // namespace process
 }  // namespace node
 #endif  // defined(NODE_WANT_INTERNALS) && NODE_WANT_INTERNALS

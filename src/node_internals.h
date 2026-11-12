@@ -109,6 +109,8 @@ std::string FormatErrorMessage(v8::Isolate* isolate,
                                v8::Local<v8::Message> message,
                                bool add_source_line = true);
 void ResetStdio();  // Safe to call more than once and from signal handlers.
+// In a child created by process.forkSelf(): make ResetStdio() a no-op.
+void DisownStdioAfterFork();
 #ifdef __POSIX__
 void SignalExit(int signal, siginfo_t* info, void* ucontext);
 #endif
