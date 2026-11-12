@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <memory>
 #include <optional>
+#include <type_traits>
 
 #include "src/ast/ast-function-literal-id-reindexer.h"
 #include "src/ast/ast-traversal-visitor.h"
@@ -719,6 +720,8 @@ void Parser::ParseProgram(Isolate* isolate, DirectHandle<Script> script,
     maybe_wrapped_arguments_ = handle(script->wrapped_arguments(), isolate);
   }
 
+  // The scanner reads script->source() (see parsing::ParseProgram).
+  scanner_.set_slice_long_source_mapping_url();
   scanner_.Initialize();
   FunctionLiteral* result = DoParseProgram(isolate, info);
   HandleDebugMagicComments(isolate, script);
@@ -3545,7 +3548,13 @@ void Parser::HandleDebugMagicComments(IsolateT* isolate,
   if (!source_url.is_null()) {
     script->set_source_url(*source_url);
   }
-  DirectHandle<String> source_mapping_url = scanner_.SourceMappingUrl(isolate);
+  DirectHandle<String> source_mapping_url;
+  if constexpr (std::is_same_v<IsolateT, Isolate>) {
+    source_mapping_url = scanner_.SourceMappingUrl(
+        isolate, direct_handle(Cast<String>(script->source()), isolate));
+  } else {
+    source_mapping_url = scanner_.SourceMappingUrl(isolate);
+  }
   // The API can provide a source map URL and the API should take precedence.
   // Let's make sure we do not override the API with the magic comment.
   if (!source_mapping_url.is_null() &&
