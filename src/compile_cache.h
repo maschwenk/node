@@ -38,6 +38,17 @@ struct CompileCacheEntry {
   CachedCodeType type;
   bool refreshed = false;
   bool persisted = false;
+  // V8 rejected the cache read from disk, so the file is replaced even if it
+  // holds a larger cache.
+  bool rejected = false;
+
+  // The compiled code of a CommonJS or ES module that missed the cache, kept
+  // to serialize the cache again when it is persisted. V8 compiles functions
+  // lazily, so the cache produced right after compilation only holds the top
+  // level, while one produced after the module ran also holds the functions
+  // that were called.
+  v8::Global<v8::Function> function;
+  v8::Global<v8::UnboundModuleScript> module_script;
 
   // Copy the cache into a new store for V8 to consume. Caller takes
   // ownership.
@@ -118,10 +129,19 @@ class CompileCacheHandler {
 
  private:
   void ReadCacheFile(CompileCacheEntry* entry);
+  // Size of the cache in the entry's file on disk if the file holds a cache
+  // for the same code, 0 otherwise.
+  uint32_t ReadCacheSizeOnDisk(const CompileCacheEntry* entry);
+  // Serializes the cache of the entry again from its compiled code, which has
+  // run by now, and keeps it if it is larger than the cache produced at
+  // compilation.
+  void SerializeAfterExecution(CompileCacheEntry* entry);
   static std::vector<char> SerializeEntry(const CompileCacheEntry* entry);
 
+  // Returns true if the cache was not accepted and is produced by this
+  // process.
   template <typename T>
-  void MaybeSaveImpl(CompileCacheEntry* entry,
+  bool MaybeSaveImpl(CompileCacheEntry* entry,
                      v8::Local<T> func_or_mod,
                      bool rejected);
 

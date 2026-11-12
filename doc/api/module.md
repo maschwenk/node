@@ -392,7 +392,11 @@ undesired behaviors (e.g. less precise test coverage).
 
 At the moment, when the compile cache is enabled and a module is loaded afresh, the
 code cache is generated from the compiled code immediately, but will only be written
-to disk when the Node.js instance is about to exit. This is subject to change. The
+to disk when the Node.js instance is about to exit. For CommonJS and ECMAScript modules,
+the code cache is generated again when it is written, so that it also contains the
+functions that have run by then, which V8 would otherwise compile again in every process
+that loads the module, and the larger of the two is written. A cache file for the same
+code is only replaced by a larger one, unless V8 rejected it. This is subject to change. The
 [`module.flushCompileCache()`][] method can be used to ensure the accumulated code cache
 is flushed to disk in case the application wants to spawn other Node.js instances
 and let them share the cache long before the parent exits.

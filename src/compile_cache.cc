@@ -19,6 +19,7 @@
 namespace node {
 
 using v8::Function;
+using v8::HandleScope;
 using v8::Local;
 using v8::Module;
 using v8::ScriptCompiler;
@@ -232,6 +233,35 @@ void CompileCacheHandler::ReadCacheFile(CompileCacheEntry* entry) {
   Debug(" success, size=%d\n", total_read);
 }
 
+uint32_t CompileCacheHandler::ReadCacheSizeOnDisk(
+    const CompileCacheEntry* entry) {
+  uv_fs_t req;
+  auto defer_req_cleanup = OnScopeLeave([&req]() { uv_fs_req_cleanup(&req); });
+  uv_file file = uv_fs_open(
+      nullptr, &req, entry->cache_filename.c_str(), O_RDONLY, 0, nullptr);
+  if (req.result < 0) {
+    return 0;
+  }
+  uv_fs_req_cleanup(&req);
+  auto defer_close = OnScopeLeave([file]() {
+    uv_fs_t close_req;
+    CHECK_EQ(0, uv_fs_close(nullptr, &close_req, file, nullptr));
+    uv_fs_req_cleanup(&close_req);
+  });
+
+  uint32_t headers[kHeaderCount];
+  uv_buf_t headers_buf =
+      uv_buf_init(reinterpret_cast<char*>(headers), sizeof(headers));
+  const int r = uv_fs_read(nullptr, &req, file, &headers_buf, 1, 0, nullptr);
+  if (r != static_cast<int>(headers_buf.len) ||
+      headers[kMagicNumberOffset] != kCacheMagicNumber ||
+      headers[kCodeSizeOffset] != entry->code_size ||
+      headers[kCodeHashOffset] != entry->code_hash) {
+    return 0;
+  }
+  return headers[kCacheSizeOffset];
+}
+
 static std::string GetRelativePath(std::string_view path,
                                    std::string_view base) {
 // On Windows, the native encoding is UTF-16, so we need to convert
@@ -315,6 +345,11 @@ CompileCacheEntry* CompileCacheHandler::GetOrInsert(const uint8_t* code,
   result->source_filename = filename_utf8.ToString();
   result->cache = nullptr;
   result->type = type;
+  // An existing entry is reused for changed code, so drop the code compiled
+  // from the old one.
+  result->rejected = false;
+  result->function.Reset();
+  result->module_script.Reset();
 
   // TODO(joyeecheung): if we fail enough times, stop trying for any future
   // files.
@@ -344,7 +379,7 @@ ScriptCompiler::CachedData* SerializeCodeCache(Local<WasmModuleObject> mod) {
 }
 
 template <typename T>
-void CompileCacheHandler::MaybeSaveImpl(CompileCacheEntry* entry,
+bool CompileCacheHandler::MaybeSaveImpl(CompileCacheEntry* entry,
                                         Local<T> func_or_mod,
                                         bool rejected) {
   DCHECK_NOT_NULL(entry);
@@ -356,38 +391,46 @@ void CompileCacheHandler::MaybeSaveImpl(CompileCacheEntry* entry,
                                     : "accepted");
   if (entry->cache != nullptr && !rejected) {  // accepted
     Debug("keeping the in-memory entry\n");
-    return;
+    return false;
   }
   if (read_only_) {
     Debug("read-only, not serializing\n");
-    return;
+    return false;
   }
   Debug("%s the in-memory entry\n",
         entry->cache == nullptr ? "initializing" : "refreshing");
+  entry->rejected = rejected;
+  entry->cache.reset();
 
   ScriptCompiler::CachedData* data = SerializeCodeCache(func_or_mod);
   if (data == nullptr) {
     Debug("[compile cache] nothing to serialize for %s %s\n",
           entry->type_name(),
           entry->source_filename);
-    return;
+    return true;
   }
   DCHECK_EQ(data->buffer_policy, ScriptCompiler::CachedData::BufferOwned);
   entry->refreshed = true;
   entry->cache.reset(data);
+  return true;
 }
 
 void CompileCacheHandler::MaybeSave(CompileCacheEntry* entry,
                                     Local<Module> mod,
                                     bool rejected) {
   DCHECK(mod->IsSourceTextModule());
-  MaybeSaveImpl(entry, mod, rejected);
+  if (MaybeSaveImpl(entry, mod, rejected)) {
+    entry->module_script.Reset(isolate_, mod->GetUnboundModuleScript());
+  }
 }
 
 void CompileCacheHandler::MaybeSave(CompileCacheEntry* entry,
                                     Local<Function> func,
                                     bool rejected) {
-  MaybeSaveImpl(entry, func, rejected);
+  if (MaybeSaveImpl(entry, func, rejected)) {
+    // Nothing else keeps the CommonJS wrapper function alive once it ran.
+    entry->function.Reset(isolate_, func);
+  }
 }
 
 void CompileCacheHandler::MaybeSave(CompileCacheEntry* entry,
@@ -395,6 +438,36 @@ void CompileCacheHandler::MaybeSave(CompileCacheEntry* entry,
                                     bool rejected) {
   DCHECK(entry->type == CachedCodeType::kWasm);
   MaybeSaveImpl(entry, mod, rejected);
+}
+
+void CompileCacheHandler::SerializeAfterExecution(CompileCacheEntry* entry) {
+  if (entry->function.IsEmpty() && entry->module_script.IsEmpty()) {
+    return;
+  }
+  HandleScope handle_scope(isolate_);
+  std::unique_ptr<ScriptCompiler::CachedData> data(
+      entry->function.IsEmpty()
+          ? ScriptCompiler::CreateCodeCache(entry->module_script.Get(isolate_))
+          : SerializeCodeCache(entry->function.Get(isolate_)));
+  entry->function.Reset();
+  entry->module_script.Reset();
+  // V8 flushes the bytecode of functions that have not run for a while, the
+  // top level included, so in a long-running process the cache produced at
+  // compilation can be the larger one.
+  int compiled_size = entry->cache == nullptr ? 0 : entry->cache->length;
+  int executed_size = data == nullptr ? 0 : data->length;
+  Debug("[compile cache] cache for %s %s after execution is %d bytes, %d at "
+        "compilation, keeping the one %s\n",
+        entry->type_name(),
+        entry->source_filename,
+        executed_size,
+        compiled_size,
+        executed_size > compiled_size ? "after execution" : "from compilation");
+  if (executed_size > compiled_size) {
+    DCHECK_EQ(data->buffer_policy, ScriptCompiler::CachedData::BufferOwned);
+    entry->cache = std::move(data);
+    entry->refreshed = true;
+  }
 }
 
 void CompileCacheHandler::MaybeSave(CompileCacheEntry* entry,
@@ -451,6 +524,7 @@ void CompileCacheHandler::Persist() {
   for (auto& pair : compiler_cache_store_) {
     auto* entry = pair.second.get();
     const char* type_name = entry->type_name();
+    SerializeAfterExecution(entry);
     if (entry->cache == nullptr) {
       Debug("[compile cache] skip persisting %s %s because the cache was not "
             "initialized\n",
@@ -471,6 +545,23 @@ void CompileCacheHandler::Persist() {
             type_name,
             entry->source_filename);
       continue;
+    }
+    // Another process may have written a cache for the same code since this
+    // one read the file, e.g. when processes that loaded the same modules
+    // exit one after another. What the cache holds depends on what ran, so
+    // keep a file that is at least as large. A rejected one is replaced.
+    if (!entry->rejected) {
+      uint32_t size_on_disk = ReadCacheSizeOnDisk(entry);
+      uint32_t size = static_cast<uint32_t>(entry->cache->length);
+      if (size_on_disk >= size) {
+        Debug("[compile cache] skip persisting %s %s because the cache on "
+              "disk is as large (%d >= %d bytes)\n",
+              type_name,
+              entry->source_filename,
+              size_on_disk,
+              size);
+        continue;
+      }
     }
 
     std::vector<char> data = SerializeEntry(entry);
