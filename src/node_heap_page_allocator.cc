@@ -27,8 +27,13 @@
 //    is returned at 2 MiB granularity instead of 256 KiB.
 //  - A freed block that is handed out again before its region was given back
 //    is cleared first, so every block V8 gets reads as zero, like a fresh
-//    mapping. (V8 itself reuses pooled pages without clearing them, but some
-//    output, such as snapshots, copies bytes it never wrote.)
+//    mapping does.
+//  - Arenas are placed at V8's own random mmap hint, so heap addresses are as
+//    random as before, and as repeatable when V8 seeds its generator.
+//
+// NODE_HEAP_HUGEPAGES_LARGE=1 also asks for huge pages in the 2 MiB-aligned
+// part of every other reservation of 2 MiB or more, which is what V8 does when
+// built with v8_enable_hugepage (it covers the code range and big objects).
 //
 // NODE_HEAP_HUGEPAGES=count installs the same allocator without arenas: every
 // call goes to V8's allocator and is only counted. NODE_HEAP_HUGEPAGES_STATS=
@@ -96,6 +101,7 @@ constexpr uint8_t kFullRegion = 0xff;
   V(block_reset)                                                               \
   V(block_cleared)                                                             \
   V(arena_map)                                                                 \
+  V(large_advised)                                                             \
   V(arena_map_failed)
 
 enum Counter {
@@ -156,10 +162,12 @@ class HeapPageAllocator final : public v8::PageAllocator {
   HeapPageAllocator(bool use_arenas,
                     size_t arena_size,
                     bool honor_discard,
+                    bool advise_large,
                     std::string stats_dir)
       : use_arenas_(use_arenas),
         arena_size_(arena_size),
         honor_discard_(honor_discard),
+        advise_large_(advise_large),
         stats_dir_(std::move(stats_dir)) {}
 
   size_t AllocatePageSize() override { return default_.AllocatePageSize(); }
@@ -186,7 +194,21 @@ class HeapPageAllocator final : public v8::PageAllocator {
     RecordShape(length, alignment, permissions, false);
     Count(k_alloc_pass);
     void* result = default_.AllocatePages(hint, length, alignment, permissions);
-    if (result == nullptr) Count(k_alloc_pass_failed);
+    if (result == nullptr) {
+      Count(k_alloc_pass_failed);
+    } else if (advise_large_ && length >= kRegionSize) {
+      // What V8 does itself when built with v8_enable_hugepage: ask for huge
+      // pages in the 2 MiB-aligned part of a large reservation. On Linux this
+      // covers the code range, which is mapped read-write-execute up front,
+      // so JIT code gets huge pages as it fills the range.
+      uintptr_t start = RoundUp(reinterpret_cast<uintptr_t>(result), kRegionSize);
+      uintptr_t end =
+          RoundDown(reinterpret_cast<uintptr_t>(result) + length, kRegionSize);
+      if (end > start) {
+        madvise(reinterpret_cast<void*>(start), end - start, MADV_HUGEPAGE);
+        Count(k_large_advised);
+      }
+    }
     MaybeWriteStats();
     return result;
   }
@@ -354,10 +376,11 @@ class HeapPageAllocator final : public v8::PageAllocator {
     char line[256];
     snprintf(line,
              sizeof(line),
-             "pid %d mode %s discard %d arena_mib %zu\n",
+             "pid %d mode %s discard %d large %d arena_mib %zu\n",
              static_cast<int>(getpid()),
              use_arenas_ ? "arena" : "count",
              honor_discard_ ? 1 : 0,
+             advise_large_ ? 1 : 0,
              arena_size_ >> 20);
     text += line;
     for (int i = 0; i < kCounterCount; i++) {
@@ -644,6 +667,7 @@ class HeapPageAllocator final : public v8::PageAllocator {
   const bool use_arenas_;
   const size_t arena_size_;
   const bool honor_discard_;
+  const bool advise_large_;
   const std::string stats_dir_;
 
   std::mutex mutex_;
@@ -689,10 +713,16 @@ HeapPageAllocator* CreateFromEnvironment() {
       value == "0") {
     honor_discard = false;
   }
+  bool advise_large = credentials::SafeGetenv("NODE_HEAP_HUGEPAGES_LARGE",
+                                              &value) &&
+                      value == "1";
   std::string stats_dir;
   credentials::SafeGetenv("NODE_HEAP_HUGEPAGES_STATS", &stats_dir);
-  HeapPageAllocator* allocator = new HeapPageAllocator(
-      use_arenas, arena_size, honor_discard, std::move(stats_dir));
+  HeapPageAllocator* allocator = new HeapPageAllocator(use_arenas,
+                                                       arena_size,
+                                                       honor_discard,
+                                                       advise_large,
+                                                       std::move(stats_dir));
   heap_page_allocator = allocator;
   atexit(WriteStatsAtExit);
   return allocator;
