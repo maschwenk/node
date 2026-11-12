@@ -35,10 +35,39 @@
 // part of every other reservation of 2 MiB or more, which is what V8 does when
 // built with v8_enable_hugepage (it covers the code range and big objects).
 //
+// Cage mode. With pointer compression V8 never asks for those 256 KiB pages:
+// each isolate reserves one 4 GiB kNoAccess "cage" through this allocator and
+// carves its pages out of it itself (base::BoundedPageAllocator, first fit
+// from the bottom), calling SetPermissions(kReadWrite) on a chunk to use it
+// and SetPermissions(kNoAccess) to free it. A 2 MiB range committed 256 KiB at
+// a time by mprotect() and touched right away never gets a huge page. So
+// kNoAccess reservations of 1 GiB or more, aligned to 1 GiB or more, are
+// recognised as cages and committed in whole 2 MiB regions instead:
+//  - The cage is marked MADV_HUGEPAGE once, when it is reserved.
+//  - SetPermissions(kReadWrite) on a chunk makes its whole 2 MiB region
+//    read-write the first time anything in it is used, so the first touch
+//    faults in a huge page; later chunks in the region need no system call.
+//    Which 4 KiB pages V8 has made accessible is tracked per region.
+//  - SetPermissions(kNoAccess) gives a region back to the kernel (PROT_NONE
+//    and MADV_DONTNEED, as V8 does) once nothing in it is in use. Freed
+//    chunks in a region that is still in use stay mapped read-write: they
+//    do not fault on access until the whole region is freed, like the pages
+//    V8 keeps in its own page pool.
+//  - A freed chunk handed out again before its region was given back is
+//    cleared first, so V8 always gets zeroed memory, as it does from a fresh
+//    mapping (the V8 cage allows uninitialized pages; cppgc's does not).
+//  - Other permissions (read-only space), DecommitPages() (unmapped hole
+//    payloads) and DiscardSystemPages() (the sweeper) are applied to the
+//    exact range, as V8's allocator does; they split the region's huge page.
+//  - The code range (kNoAccessWillJitLater) is left alone, and no mapping is
+//    replaced, so the cage keeps the flags V8 gave it (MADV_DONTFORK).
+// NODE_HEAP_HUGEPAGES_CAGE=0 turns cage mode off.
+//
 // NODE_HEAP_HUGEPAGES=count installs the same allocator without arenas: every
-// call goes to V8's allocator and is only counted. NODE_HEAP_HUGEPAGES_STATS=
-// <directory> writes the counters to <directory>/heap-pages-<pid>.txt every
-// couple of seconds and at exit.
+// call goes to V8's allocator and is only counted (cages are tracked as if
+// cage mode were on, to see how many regions it would commit).
+// NODE_HEAP_HUGEPAGES_STATS=<directory> writes the counters to
+// <directory>/heap-pages-<pid>.txt every couple of seconds and at exit.
 
 #include "node_heap_page_allocator.h"
 
@@ -76,6 +105,86 @@ constexpr size_t kBlocksPerRegion = kRegionSize / kBlockSize;
 static_assert(kBlocksPerRegion == 8, "one byte of block bits per region");
 constexpr uint8_t kFullRegion = 0xff;
 
+// Cages are tracked in 4 KiB pages (V8's commit page size on Linux).
+constexpr size_t kCagePageSize = size_t{4} * 1024;
+constexpr size_t kCagePagesPerRegion = kRegionSize / kCagePageSize;
+constexpr size_t kCageWordsPerRegion = kCagePagesPerRegion / 64;
+static_assert(kCageWordsPerRegion * 64 == kCagePagesPerRegion, "whole words");
+// Smallest size and alignment of a kNoAccess reservation treated as a cage.
+// V8's pointer-compression cage is 4 GiB and 4 GiB-aligned; the code range
+// (256 MiB, kNoAccessWillJitLater) and WebAssembly memories (64 KiB-aligned)
+// are not cages.
+constexpr size_t kMinCageSize = size_t{1} << 30;
+
+enum class CageMode { kOff, kCount, kOn };
+
+// Operations on cage memory, for the call-shape table.
+enum CageOp {
+  kOpReadWrite,
+  kOpOtherPermission,
+  kOpNoAccess,
+  kOpDecommit,
+  kOpDiscard,
+  kOpRecommit,
+  kOpFreePart,
+  kOpReleasePart,
+  kCageOpCount
+};
+const char* const kCageOpNames[] = {"rw",
+                                    "other_perm",
+                                    "noaccess",
+                                    "decommit",
+                                    "discard",
+                                    "recommit",
+                                    "free_part",
+                                    "release_part"};
+
+// Calls fn(word, mask) for the words of a page bitmap that hold [from, to).
+template <typename Fn>
+void ForEachMask(size_t from, size_t to, Fn fn) {
+  while (from < to) {
+    size_t word = from / 64;
+    size_t low = from % 64;
+    size_t high = std::min<size_t>(64, low + (to - from));
+    uint64_t mask = high == 64 ? ~uint64_t{0} : (uint64_t{1} << high) - 1;
+    mask &= ~((uint64_t{1} << low) - 1);
+    fn(word, mask);
+    from += high - low;
+  }
+}
+
+// Sets the bits [from, to) and returns how many were not set before.
+size_t SetBits(uint64_t* words, size_t from, size_t to) {
+  size_t count = 0;
+  ForEachMask(from, to, [&](size_t word, uint64_t mask) {
+    count += __builtin_popcountll(mask & ~words[word]);
+    words[word] |= mask;
+  });
+  return count;
+}
+
+// Clears the bits [from, to) and returns how many were set before.
+size_t ClearBits(uint64_t* words, size_t from, size_t to) {
+  size_t count = 0;
+  ForEachMask(from, to, [&](size_t word, uint64_t mask) {
+    count += __builtin_popcountll(mask & words[word]);
+    words[word] &= ~mask;
+  });
+  return count;
+}
+
+bool AnyBits(const uint64_t* words, size_t from, size_t to) {
+  bool any = false;
+  ForEachMask(from, to, [&](size_t word, uint64_t mask) {
+    if ((words[word] & mask) != 0) any = true;
+  });
+  return any;
+}
+
+bool TestBit(const uint64_t* words, size_t bit) {
+  return (words[bit / 64] >> (bit % 64)) & 1;
+}
+
 #define HEAP_PAGE_COUNTERS(V)                                                  \
   V(alloc_arena)                                                               \
   V(alloc_pass)                                                                \
@@ -102,7 +211,25 @@ constexpr uint8_t kFullRegion = 0xff;
   V(block_cleared)                                                             \
   V(arena_map)                                                                 \
   V(large_advised)                                                             \
-  V(arena_map_failed)
+  V(arena_map_failed)                                                          \
+  V(cage_adopt)                                                                \
+  V(cage_free)                                                                 \
+  V(cage_rw)                                                                   \
+  V(cage_rw_fixup)                                                             \
+  V(cage_other_perm)                                                           \
+  V(cage_noaccess)                                                             \
+  V(cage_noaccess_kept)                                                        \
+  V(cage_decommit)                                                             \
+  V(cage_discard)                                                              \
+  V(cage_discard_ignored)                                                      \
+  V(cage_recommit)                                                             \
+  V(cage_free_part)                                                            \
+  V(cage_release_part)                                                         \
+  V(cage_region_commit)                                                        \
+  V(cage_region_commit_failed)                                                 \
+  V(cage_region_release)                                                       \
+  V(cage_region_release_split)                                                 \
+  V(cage_pages_cleared)
 
 enum Counter {
 #define V(name) k_##name,
@@ -163,11 +290,13 @@ class HeapPageAllocator final : public v8::PageAllocator {
                     size_t arena_size,
                     bool honor_discard,
                     bool advise_large,
+                    CageMode cage_mode,
                     std::string stats_dir)
       : use_arenas_(use_arenas),
         arena_size_(arena_size),
         honor_discard_(honor_discard),
         advise_large_(advise_large),
+        cage_mode_(cage_mode),
         stats_dir_(std::move(stats_dir)) {}
 
   size_t AllocatePageSize() override { return default_.AllocatePageSize(); }
@@ -196,6 +325,15 @@ class HeapPageAllocator final : public v8::PageAllocator {
     void* result = default_.AllocatePages(hint, length, alignment, permissions);
     if (result == nullptr) {
       Count(k_alloc_pass_failed);
+    } else if (cage_mode_ != CageMode::kOff && permissions == kNoAccess &&
+               length >= kMinCageSize && alignment >= kMinCageSize &&
+               length % kRegionSize == 0 &&
+               reinterpret_cast<uintptr_t>(result) % kRegionSize == 0) {
+      // A pointer-compression cage (4 GiB, 4 GiB-aligned). WebAssembly
+      // memories are large kNoAccess reservations too, but only 64 KiB-aligned;
+      // they rely on accesses past the committed size faulting, so they must
+      // never be committed in larger steps than V8 asks for.
+      AdoptCage(reinterpret_cast<uintptr_t>(result), length);
     } else if (advise_large_ && length >= kRegionSize) {
       // What V8 does itself when built with v8_enable_hugepage: ask for huge
       // pages in the 2 MiB-aligned part of a large reservation. On Linux this
@@ -220,6 +358,17 @@ class HeapPageAllocator final : public v8::PageAllocator {
         FreeBlock(arena, reinterpret_cast<uintptr_t>(address), length);
         Count(k_free_arena);
         return true;
+      }
+      uintptr_t start = reinterpret_cast<uintptr_t>(address);
+      if (Cage* cage = FindCage(start)) {
+        if (start == cage->start && length >= cage->end - cage->start) {
+          DropCage(cage);
+        } else {
+          // Not expected: V8 frees cage memory with SetPermissions().
+          Count(k_cage_free_part);
+          RecordCageShape(kOpFreePart, length);
+          CageNoAccess(cage, start, length);
+        }
       }
     }
     Count(k_free_pass);
@@ -249,6 +398,14 @@ class HeapPageAllocator final : public v8::PageAllocator {
         Count(k_release_arena);
         return true;
       }
+      uintptr_t start = reinterpret_cast<uintptr_t>(address);
+      if (Cage* cage = FindCage(start)) {
+        // Not expected either (the cage's own allocator releases with
+        // SetPermissions()); V8's allocator unmaps the tail.
+        Count(k_cage_release_part);
+        RecordCageShape(kOpReleasePart, length - new_length);
+        CageNoAccess(cage, start + new_length, length - new_length);
+      }
     }
     Count(k_release_pass);
     return default_.ReleasePages(address, length, new_length);
@@ -257,10 +414,10 @@ class HeapPageAllocator final : public v8::PageAllocator {
   bool SetPermissions(void* address,
                       size_t length,
                       Permission permissions) override {
+    uintptr_t start = reinterpret_cast<uintptr_t>(address);
     {
-      std::lock_guard<std::mutex> lock(mutex_);
+      std::unique_lock<std::mutex> lock(mutex_);
       if (Arena* arena = FindArena(address)) {
-        uintptr_t start = reinterpret_cast<uintptr_t>(address);
         if (permissions == kReadWrite && !AnyChanged(arena, start, length)) {
           Count(k_perm_rw_noop);
           return true;
@@ -277,6 +434,17 @@ class HeapPageAllocator final : public v8::PageAllocator {
         MarkChanged(arena, start, length, true);
         return true;
       }
+      if (Cage* cage = FindCage(start)) {
+        ZeroList zero;
+        bool result = CageSetPermissions(cage, start, length, permissions, &zero);
+        if (cage_mode_ == CageMode::kOn) {
+          lock.unlock();
+          ClearRanges(zero);
+          MaybeWriteStats();
+          return result;
+        }
+        // Count mode: V8's allocator does the work.
+      }
     }
     Count(k_perm_pass);
     return default_.SetPermissions(address, length, permissions);
@@ -285,13 +453,27 @@ class HeapPageAllocator final : public v8::PageAllocator {
   bool RecommitPages(void* address,
                      size_t length,
                      Permission permissions) override {
+    uintptr_t start = reinterpret_cast<uintptr_t>(address);
     {
-      std::lock_guard<std::mutex> lock(mutex_);
+      std::unique_lock<std::mutex> lock(mutex_);
       if (FindArena(address) != nullptr) {
         // V8's allocator does nothing here on Linux either: the pages come
         // back on their next touch.
         Count(k_recommit_arena);
         return true;
+      }
+      if (Cage* cage = FindCage(start)) {
+        // Only the code range is set up to recommit; handled like
+        // SetPermissions() in case it ever happens in a cage.
+        Count(k_cage_recommit);
+        RecordCageShape(kOpRecommit, length);
+        ZeroList zero;
+        bool result = CageSetPermissions(cage, start, length, permissions, &zero);
+        if (cage_mode_ == CageMode::kOn) {
+          lock.unlock();
+          ClearRanges(zero);
+          return result;
+        }
       }
     }
     Count(k_recommit_pass);
@@ -299,6 +481,7 @@ class HeapPageAllocator final : public v8::PageAllocator {
   }
 
   bool DiscardSystemPages(void* address, size_t size) override {
+    uintptr_t start = reinterpret_cast<uintptr_t>(address);
     {
       std::lock_guard<std::mutex> lock(mutex_);
       if (Arena* arena = FindArena(address)) {
@@ -312,12 +495,24 @@ class HeapPageAllocator final : public v8::PageAllocator {
         MarkChanged(arena, reinterpret_cast<uintptr_t>(address), size, false);
         return true;
       }
+      if (Cage* cage = FindCage(start)) {
+        RecordCageShape(kOpDiscard, size);
+        if (!honor_discard_) {
+          Count(k_cage_discard_ignored);
+          if (cage_mode_ == CageMode::kOn) return true;
+        } else {
+          Count(k_cage_discard);
+          CageDiscard(cage, start, size);
+          if (cage_mode_ == CageMode::kOn) return true;
+        }
+      }
     }
     Count(k_discard_pass);
     return default_.DiscardSystemPages(address, size);
   }
 
   bool DecommitPages(void* address, size_t size) override {
+    uintptr_t start = reinterpret_cast<uintptr_t>(address);
     {
       std::lock_guard<std::mutex> lock(mutex_);
       if (Arena* arena = FindArena(address)) {
@@ -337,6 +532,12 @@ class HeapPageAllocator final : public v8::PageAllocator {
         MarkChanged(arena, reinterpret_cast<uintptr_t>(address), size, true);
         Count(k_decommit_arena);
         return true;
+      }
+      if (Cage* cage = FindCage(start)) {
+        Count(k_cage_decommit);
+        RecordCageShape(kOpDecommit, size);
+        bool result = CageDecommit(cage, start, size);
+        if (cage_mode_ == CageMode::kOn) return result;
       }
     }
     Count(k_decommit_pass);
@@ -376,12 +577,15 @@ class HeapPageAllocator final : public v8::PageAllocator {
     char line[256];
     snprintf(line,
              sizeof(line),
-             "pid %d mode %s discard %d large %d arena_mib %zu\n",
+             "pid %d mode %s discard %d large %d arena_mib %zu cage %s\n",
              static_cast<int>(getpid()),
              use_arenas_ ? "arena" : "count",
              honor_discard_ ? 1 : 0,
              advise_large_ ? 1 : 0,
-             arena_size_ >> 20);
+             arena_size_ >> 20,
+             cage_mode_ == CageMode::kOn
+                 ? "on"
+                 : (cage_mode_ == CageMode::kCount ? "count" : "off"));
     text += line;
     for (int i = 0; i < kCounterCount; i++) {
       snprintf(line,
@@ -410,6 +614,38 @@ class HeapPageAllocator final : public v8::PageAllocator {
                used_regions,
                changed_regions);
       text += line;
+      size_t split_cage_regions = 0;
+      for (const Cage& cage : cages_) {
+        size_t regions = (cage.end - cage.start) / kRegionSize;
+        for (size_t r = 0; r < regions; r++) {
+          if (cage.regions[r].committed && cage.regions[r].split) {
+            split_cage_regions++;
+          }
+        }
+      }
+      // Regions are 2 MiB, pages 4 KiB.
+      snprintf(line,
+               sizeof(line),
+               "cages %zu committed_regions %zu live_pages %zu "
+               "peak_committed_regions %zu live_pages_at_peak %zu "
+               "peak_live_pages %zu split_regions %zu\n",
+               cages_.size(),
+               committed_regions_,
+               live_pages_,
+               peak_committed_regions_,
+               live_pages_at_peak_,
+               peak_live_pages_,
+               split_cage_regions);
+      text += line;
+      for (const CageShape& shape : cage_shapes_) {
+        snprintf(line,
+                 sizeof(line),
+                 "cage_shape op %s length %zu count %" PRIu64 "\n",
+                 kCageOpNames[shape.op],
+                 shape.length,
+                 shape.count);
+        text += line;
+      }
       for (const Shape& shape : shapes_) {
         snprintf(line,
                  sizeof(line),
@@ -453,6 +689,346 @@ class HeapPageAllocator final : public v8::PageAllocator {
     uint64_t count;
     uint64_t bytes;
   };
+
+  // One 2 MiB region of a cage. Bitmaps have one bit per 4 KiB page.
+  struct CageRegion {
+    uint64_t live[kCageWordsPerRegion];   // made accessible by V8, not freed
+    uint64_t stale[kCageWordsPerRegion];  // freed by V8, region kept: not zero
+    uint64_t odd[kCageWordsPerRegion];    // protection is not read-write
+    uint16_t live_count;
+    bool committed;  // the whole region is mapped (read-write but odd pages)
+    bool split;      // part of it was protected or discarded
+  };
+
+  struct Cage {
+    uintptr_t start;
+    uintptr_t end;
+    CageRegion* regions;
+  };
+
+  struct ZeroRange {
+    uintptr_t start;
+    size_t size;
+  };
+  using ZeroList = std::vector<ZeroRange>;
+
+  struct CageShape {
+    CageOp op;
+    size_t length;
+    uint64_t count;
+  };
+
+  // Whether cage calls are carried out here (on) or only tracked (count).
+  bool ApplyCage() const { return cage_mode_ == CageMode::kOn; }
+
+  void AdoptCage(uintptr_t start, size_t length) {
+    // calloc() maps large blocks fresh, so the bookkeeping of regions V8
+    // never uses is never touched.
+    CageRegion* regions = static_cast<CageRegion*>(
+        calloc(length / kRegionSize, sizeof(CageRegion)));
+    if (regions == nullptr) return;  // Stays an ordinary reservation.
+    if (ApplyCage()) {
+      // One call for the whole reservation; the read-write ranges carved out
+      // of it later keep the flag.
+      madvise(reinterpret_cast<void*>(start), length, MADV_HUGEPAGE);
+    }
+    std::lock_guard<std::mutex> lock(mutex_);
+    cages_.push_back({start, start + length, regions});
+    Count(k_cage_adopt);
+  }
+
+  // Requires mutex_.
+  Cage* FindCage(uintptr_t address) {
+    for (Cage& cage : cages_) {
+      if (address >= cage.start && address < cage.end) return &cage;
+    }
+    return nullptr;
+  }
+
+  // Requires mutex_. The whole reservation is being freed.
+  void DropCage(Cage* cage) {
+    size_t regions = (cage->end - cage->start) / kRegionSize;
+    for (size_t r = 0; r < regions; r++) {
+      if (cage->regions[r].committed) {
+        committed_regions_--;
+        live_pages_ -= cage->regions[r].live_count;
+      }
+    }
+    free(cage->regions);
+    cages_.erase(cages_.begin() + (cage - cages_.data()));
+    Count(k_cage_free);
+  }
+
+  // Requires mutex_. Calls fn(region, region_start, from, to) for each 2 MiB
+  // region overlapping [start, start + length), with [from, to) the pages of
+  // the region in the range.
+  template <typename Fn>
+  void ForEachCageRegion(Cage* cage, uintptr_t start, size_t length, Fn fn) {
+    uintptr_t end = std::min(start + length, cage->end);
+    for (uintptr_t base = RoundDown(start, kRegionSize); base < end;
+         base += kRegionSize) {
+      size_t from = (std::max(start, base) - base) / kCagePageSize;
+      size_t to = (std::min(end, base + kRegionSize) - base + kCagePageSize - 1) /
+                  kCagePageSize;
+      fn(cage->regions[(base - cage->start) / kRegionSize], base, from, to);
+    }
+  }
+
+  static void* PageAddress(uintptr_t base, size_t page) {
+    return reinterpret_cast<void*>(base + page * kCagePageSize);
+  }
+
+  // Requires mutex_. Makes the whole region read-write; its first touch then
+  // faults in a huge page.
+  bool CommitRegion(CageRegion& region, uintptr_t base) {
+    if (ApplyCage() && mprotect(reinterpret_cast<void*>(base),
+                                kRegionSize,
+                                PROT_READ | PROT_WRITE) != 0) {
+      CHECK_EQ(errno, ENOMEM);
+      Count(k_cage_region_commit_failed);
+      return false;
+    }
+    region.committed = true;
+    committed_regions_++;
+    Count(k_cage_region_commit);
+    return true;
+  }
+
+  // Requires mutex_. Nothing in the region is in use: give it back, as V8's
+  // SetPermissions(kNoAccess) does. With CONFIG_PT_RECLAIM, MADV_DONTNEED of
+  // the whole region also frees the page table of a split region, so it can
+  // get a huge page again.
+  void ReleaseRegion(CageRegion& region, uintptr_t base) {
+    if (ApplyCage()) {
+      void* address = reinterpret_cast<void*>(base);
+      if (mprotect(address, kRegionSize, PROT_NONE) != 0) {
+        CHECK_EQ(errno, ENOMEM);
+      }
+      madvise(address, kRegionSize, MADV_DONTNEED);
+    }
+    Count(region.split ? k_cage_region_release_split : k_cage_region_release);
+    memset(&region, 0, sizeof(region));
+    committed_regions_--;
+  }
+
+  // Requires mutex_.
+  void AddLive(CageRegion& region, size_t from, size_t to) {
+    size_t added = SetBits(region.live, from, to);
+    region.live_count += added;
+    live_pages_ += added;
+  }
+
+  // Requires mutex_.
+  void RemoveLive(CageRegion& region, size_t from, size_t to) {
+    size_t removed = ClearBits(region.live, from, to);
+    region.live_count -= removed;
+    live_pages_ -= removed;
+  }
+
+  // Requires mutex_.
+  void UpdatePeaks() {
+    if (committed_regions_ > peak_committed_regions_) {
+      peak_committed_regions_ = committed_regions_;
+      live_pages_at_peak_ = live_pages_;
+    }
+    if (live_pages_ > peak_live_pages_) peak_live_pages_ = live_pages_;
+  }
+
+  // Requires mutex_. Clears the stale pages in [from, to): into |zero| to be
+  // cleared after the lock is dropped, or right away when |zero| is null.
+  // Stale pages are always read-write.
+  void ClearStale(CageRegion& region,
+                  uintptr_t base,
+                  size_t from,
+                  size_t to,
+                  ZeroList* zero) {
+    if (!AnyBits(region.stale, from, to)) return;
+    for (size_t page = from; page < to;) {
+      if (!TestBit(region.stale, page)) {
+        page++;
+        continue;
+      }
+      size_t end = page;
+      while (end < to && TestBit(region.stale, end)) end++;
+      if (ApplyCage()) {
+        ZeroRange range{reinterpret_cast<uintptr_t>(PageAddress(base, page)),
+                        (end - page) * kCagePageSize};
+        if (zero != nullptr) {
+          zero->push_back(range);
+        } else {
+          memset(reinterpret_cast<void*>(range.start), 0, range.size);
+        }
+      }
+      counters_[k_cage_pages_cleared].fetch_add(end - page,
+                                                std::memory_order_relaxed);
+      page = end;
+    }
+    ClearBits(region.stale, from, to);
+  }
+
+  void ClearRanges(const ZeroList& zero) {
+    for (const ZeroRange& range : zero) {
+      memset(reinterpret_cast<void*>(range.start), 0, range.size);
+    }
+  }
+
+  // Requires mutex_.
+  bool CageSetPermissions(Cage* cage,
+                          uintptr_t start,
+                          size_t length,
+                          Permission permission,
+                          ZeroList* zero) {
+    if (permission == kNoAccess || permission == kNoAccessWillJitLater) {
+      Count(k_cage_noaccess);
+      RecordCageShape(kOpNoAccess, length);
+      CageNoAccess(cage, start, length);
+      return true;
+    }
+    bool read_write = permission == kReadWrite;
+    Count(read_write ? k_cage_rw : k_cage_other_perm);
+    RecordCageShape(read_write ? kOpReadWrite : kOpOtherPermission, length);
+    // Commit every region first, so that running out of memory leaves
+    // nothing half done.
+    bool ok = true;
+    ForEachCageRegion(
+        cage, start, length, [&](CageRegion& region, uintptr_t base, size_t, size_t) {
+          if (ok && !region.committed && !CommitRegion(region, base)) ok = false;
+        });
+    if (!ok) {
+      ForEachCageRegion(
+          cage, start, length, [&](CageRegion& region, uintptr_t base, size_t, size_t) {
+            if (region.committed && region.live_count == 0) {
+              ReleaseRegion(region, base);
+            }
+          });
+      return false;
+    }
+    ForEachCageRegion(
+        cage,
+        start,
+        length,
+        [&](CageRegion& region, uintptr_t base, size_t from, size_t to) {
+          if (!ok) return;
+          void* address = PageAddress(base, from);
+          size_t size = (to - from) * kCagePageSize;
+          // Old contents must go before the pages can lose write access.
+          ClearStale(region, base, from, to, read_write ? zero : nullptr);
+          if (read_write) {
+            if (AnyBits(region.odd, from, to)) {
+              if (ApplyCage() &&
+                  mprotect(address, size, PROT_READ | PROT_WRITE) != 0) {
+                CHECK_EQ(errno, ENOMEM);
+                ok = false;
+                return;
+              }
+              ClearBits(region.odd, from, to);
+              Count(k_cage_rw_fixup);
+            }
+          } else {
+            if (ApplyCage() &&
+                mprotect(address, size, ProtectionFor(permission)) != 0) {
+              CHECK_EQ(errno, ENOMEM);
+              ok = false;
+              return;
+            }
+            SetBits(region.odd, from, to);
+            region.split = true;
+          }
+          AddLive(region, from, to);
+        });
+    UpdatePeaks();
+    return ok;
+  }
+
+  // Requires mutex_. V8 frees [start, start + length).
+  void CageNoAccess(Cage* cage, uintptr_t start, size_t length) {
+    ForEachCageRegion(
+        cage,
+        start,
+        length,
+        [&](CageRegion& region, uintptr_t base, size_t from, size_t to) {
+          if (!region.committed) return;  // Already inaccessible.
+          RemoveLive(region, from, to);
+          if (region.live_count == 0) {
+            ReleaseRegion(region, base);
+            return;
+          }
+          // The rest of the region is in use: keep the freed pages mapped
+          // read-write, to be cleared if they are used again.
+          Count(k_cage_noaccess_kept);
+          if (AnyBits(region.odd, from, to)) {
+            if (!ApplyCage() || mprotect(PageAddress(base, from),
+                                         (to - from) * kCagePageSize,
+                                         PROT_READ | PROT_WRITE) == 0) {
+              ClearBits(region.odd, from, to);
+            } else {
+              CHECK_EQ(errno, ENOMEM);
+              return;  // Left as it is; not marked stale, so never written.
+            }
+          }
+          SetBits(region.stale, from, to);
+        });
+  }
+
+  // Requires mutex_. As V8's DecommitPages(): inaccessible, zero when made
+  // accessible again. Applied to the exact range (it splits the huge page).
+  bool CageDecommit(Cage* cage, uintptr_t start, size_t length) {
+    bool ok = true;
+    ForEachCageRegion(
+        cage,
+        start,
+        length,
+        [&](CageRegion& region, uintptr_t base, size_t from, size_t to) {
+          if (!ok || !region.committed) return;  // Uncommitted: already so.
+          void* address = PageAddress(base, from);
+          size_t size = (to - from) * kCagePageSize;
+          if (ApplyCage()) {
+            if (mprotect(address, size, PROT_NONE) != 0) {
+              CHECK_EQ(errno, ENOMEM);
+              ok = false;
+              return;
+            }
+            CHECK_EQ(madvise(address, size, MADV_DONTNEED), 0);
+          }
+          SetBits(region.odd, from, to);
+          ClearBits(region.stale, from, to);
+          region.split = true;
+          RemoveLive(region, from, to);
+          if (region.live_count == 0) ReleaseRegion(region, base);
+        });
+    return ok;
+  }
+
+  // Requires mutex_. A hint to drop the contents; the pages stay accessible.
+  void CageDiscard(Cage* cage, uintptr_t start, size_t length) {
+    ForEachCageRegion(
+        cage,
+        start,
+        length,
+        [&](CageRegion& region, uintptr_t base, size_t from, size_t to) {
+          if (!region.committed) return;
+          if (ApplyCage()) {
+            CHECK_EQ(madvise(PageAddress(base, from),
+                             (to - from) * kCagePageSize,
+                             MADV_DONTNEED),
+                     0);
+          }
+          ClearBits(region.stale, from, to);
+          region.split = true;
+        });
+  }
+
+  // Requires mutex_.
+  void RecordCageShape(CageOp op, size_t length) {
+    if (stats_dir_.empty()) return;
+    for (CageShape& shape : cage_shapes_) {
+      if (shape.op == op && shape.length == length) {
+        shape.count++;
+        return;
+      }
+    }
+    if (cage_shapes_.size() < 256) cage_shapes_.push_back({op, length, 1});
+  }
 
   void Count(Counter counter) {
     counters_[counter].fetch_add(1, std::memory_order_relaxed);
@@ -668,9 +1244,17 @@ class HeapPageAllocator final : public v8::PageAllocator {
   const size_t arena_size_;
   const bool honor_discard_;
   const bool advise_large_;
+  const CageMode cage_mode_;
   const std::string stats_dir_;
 
   std::mutex mutex_;
+  std::vector<Cage> cages_;
+  size_t committed_regions_ = 0;
+  size_t live_pages_ = 0;
+  size_t peak_committed_regions_ = 0;
+  size_t live_pages_at_peak_ = 0;
+  size_t peak_live_pages_ = 0;
+  std::vector<CageShape> cage_shapes_;
   std::vector<Arena> arenas_;
   size_t live_blocks_ = 0;
   size_t peak_blocks_ = 0;
@@ -716,12 +1300,20 @@ HeapPageAllocator* CreateFromEnvironment() {
   bool advise_large = credentials::SafeGetenv("NODE_HEAP_HUGEPAGES_LARGE",
                                               &value) &&
                       value == "1";
+  CageMode cage_mode = use_arenas ? CageMode::kOn : CageMode::kCount;
+  if ((credentials::SafeGetenv("NODE_HEAP_HUGEPAGES_CAGE", &value) &&
+       value == "0") ||
+      sysconf(_SC_PAGESIZE) != static_cast<long>(kCagePageSize)) {
+    // 2 MiB is the huge page size only with 4 KiB base pages.
+    cage_mode = CageMode::kOff;
+  }
   std::string stats_dir;
   credentials::SafeGetenv("NODE_HEAP_HUGEPAGES_STATS", &stats_dir);
   HeapPageAllocator* allocator = new HeapPageAllocator(use_arenas,
                                                        arena_size,
                                                        honor_discard,
                                                        advise_large,
+                                                       cage_mode,
                                                        std::move(stats_dir));
   heap_page_allocator = allocator;
   atexit(WriteStatsAtExit);
