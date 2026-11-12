@@ -812,6 +812,9 @@ static void CreatePerIsolateProperties(IsolateData* isolate_data,
 
 #if defined __POSIX__ && !defined(__PASE__)
   SetMethod(isolate, target, "execve", Execve);
+  SetMethod(isolate, target, "forkSelf", ForkSelf);
+  SetMethod(
+      isolate, target, "setForkSelfExitCallback", SetForkSelfExitCallback);
 #endif
   SetMethodNoSideEffect(isolate, target, "uptime", Uptime);
   SetMethod(isolate, target, "patchProcessObject", PatchProcessObject);
@@ -860,6 +863,8 @@ void RegisterExternalReferences(ExternalReferenceRegistry* registry) {
 
 #if defined __POSIX__ && !defined(__PASE__)
   registry->Register(Execve);
+  registry->Register(ForkSelf);
+  registry->Register(SetForkSelfExitCallback);
 #endif
   registry->Register(Uptime);
   registry->Register(PatchProcessObject);

@@ -666,12 +666,22 @@ static void PlatformInit(ProcessInitializationFlags::Flags flags) {
 #endif  // _WIN32
 }
 
+// Set in a process created by process.forkSelf(): the stdio state recorded by
+// PlatformInit() belongs to the parent, which still uses the same open file
+// descriptions (O_NONBLOCK is shared between processes) and terminal.
+static std::atomic<bool> stdio_owned_by_parent = false;
+
+void DisownStdioAfterFork() {
+  stdio_owned_by_parent.store(true);
+}
+
 // Safe to call more than once and from signal handlers.
 void ResetStdio() {
   if (init_process_flags.load() &
       ProcessInitializationFlags::kNoStdioInitialization) {
     return;
   }
+  if (stdio_owned_by_parent.load()) return;
 
   uv_tty_reset_mode();
 #ifdef __POSIX__
@@ -822,6 +832,22 @@ static ExitCode ProcessGlobalArgsInternal(std::vector<std::string>* args,
                arg.starts_with("--external_memory_max_reasonable_size");
       })) {
     v8_args.emplace_back("--external-memory-max-reasonable-size=0");
+  }
+
+  // NODE_V8_FLAGS: V8 flags applied before V8 is initialized, for flags that
+  // NODE_OPTIONS does not accept. Every process that inherits the environment
+  // gets them, which is what a pool of forked workers needs.
+  if (settings == kDisallowedInEnvvar) {
+    std::string env_v8_flags;
+    if (credentials::SafeGetenv("NODE_V8_FLAGS", &env_v8_flags)) {
+      size_t start = 0;
+      while (start < env_v8_flags.size()) {
+        size_t end = env_v8_flags.find(' ', start);
+        if (end == std::string::npos) end = env_v8_flags.size();
+        if (end > start) v8_args.emplace_back(env_v8_flags, start, end - start);
+        start = end + 1;
+      }
+    }
   }
 
 #ifdef __POSIX__

@@ -1,4 +1,5 @@
 #include "compile_cache.h"
+#include <algorithm>
 #include <string>
 #include "debug_utils-inl.h"
 #include "env-inl.h"
@@ -19,10 +20,15 @@
 namespace node {
 
 using v8::Function;
+using v8::GCCallbackFlags;
+using v8::GCType;
+using v8::HandleScope;
+using v8::Isolate;
 using v8::Local;
 using v8::Module;
 using v8::ScriptCompiler;
 using v8::String;
+using v8::UnboundModuleScript;
 
 namespace {
 std::string Uint32ToHex(uint32_t crc) {
@@ -302,6 +308,10 @@ CompileCacheEntry* CompileCacheHandler::GetOrInsert(Local<String> code,
   result->source_filename = filename_utf8.ToString();
   result->cache = nullptr;
   result->type = type;
+  // The entry may be reused for changed code (emplace() keeps the existing
+  // one): what was known about the old code's cache no longer applies.
+  result->best_size = 0;
+  result->rejected = false;
 
   // TODO(joyeecheung): if we fail enough times, stop trying for any future
   // files.
@@ -318,32 +328,169 @@ ScriptCompiler::CachedData* SerializeCodeCache(Local<Module> mod) {
   return ScriptCompiler::CreateCodeCache(mod->GetUnboundModuleScript());
 }
 
+void CompileCacheHandler::Retain(CompileCacheEntry* entry,
+                                 Local<Function> func) {
+  entry->function.Reset(isolate_, func);
+}
+
+void CompileCacheHandler::Retain(CompileCacheEntry* entry, Local<Module> mod) {
+  entry->module_script.Reset(isolate_, mod->GetUnboundModuleScript());
+}
+
 template <typename T>
 void CompileCacheHandler::MaybeSaveImpl(CompileCacheEntry* entry,
                                         Local<T> func_or_mod,
                                         bool rejected) {
   DCHECK_NOT_NULL(entry);
+  const bool accepted = entry->cache != nullptr && !rejected;
   Debug("[compile cache] V8 code cache for %s %s was %s, ",
         entry->type_name(),
         entry->source_filename,
         rejected                    ? "rejected"
         : (entry->cache == nullptr) ? "not initialized"
                                     : "accepted");
-  if (entry->cache != nullptr && !rejected) {  // accepted
-    Debug("keeping the in-memory entry\n");
-    return;
-  }
-  if (read_only_) {
-    Debug("read-only, not serializing\n");
-    return;
-  }
-  Debug("%s the in-memory entry\n",
-        entry->cache == nullptr ? "initializing" : "refreshing");
+  if (capture_mode_ == CaptureMode::kCompile || read_only_) {
+    if (accepted) {
+      Debug("keeping the in-memory entry\n");
+      return;
+    }
+    if (read_only_) {
+      Debug("read-only, not serializing\n");
+      return;
+    }
+    Debug("%s the in-memory entry\n",
+          entry->cache == nullptr ? "initializing" : "refreshing");
 
-  ScriptCompiler::CachedData* data = SerializeCodeCache(func_or_mod);
+    ScriptCompiler::CachedData* data = SerializeCodeCache(func_or_mod);
+    DCHECK_EQ(data->buffer_policy, ScriptCompiler::CachedData::BufferOwned);
+    entry->refreshed = true;
+    entry->cache.reset(data);
+    return;
+  }
+
+  if (accepted) {
+    // V8 has consumed its own copy (see CopyCache()), only the size is still
+    // needed, to decide whether a later cache is worth writing.
+    entry->best_size = entry->cache->length;
+    entry->cache.reset();
+    if (refresh_interval_ == 0 ||
+        (entry->cache_key ^ refresh_seed_) % refresh_interval_ != 0) {
+      Debug("keeping the in-memory entry\n");
+      return;
+    }
+    Debug("keeping the in-memory entry, refreshing it after execution\n");
+  } else {
+    if (rejected) {
+      entry->cache.reset();
+      entry->best_size = 0;
+      entry->rejected = true;
+    }
+    Debug("%s the in-memory entry after execution\n",
+          rejected ? "refreshing" : "initializing");
+  }
+  Retain(entry, func_or_mod);
+  if (!entry->retained) {
+    entry->retained = true;
+    entry->compiled_at_gc = mark_compacts_;
+    if (checkpoint_gcs_ > 0) pending_checkpoint_.push_back(entry);
+  }
+}
+
+// Whether a cache of new_size bytes is worth replacing one of old_size bytes
+// for the same code. Caches produced after execution grow with the functions
+// that ran, but the size of a cache for the same code also varies by a few
+// dozen bytes from run to run, which must not cause a rewrite on every run.
+static bool IsLarger(uint32_t new_size, uint32_t old_size) {
+  if (old_size == 0) return new_size > 0;
+  return new_size > old_size + std::max<uint32_t>(64, old_size / 256);
+}
+
+bool CompileCacheHandler::Capture(CompileCacheEntry* entry) {
+  ScriptCompiler::CachedData* data = nullptr;
+  if (!entry->function.IsEmpty()) {
+    data = SerializeCodeCache(entry->function.Get(isolate_));
+  } else if (!entry->module_script.IsEmpty()) {
+    data = ScriptCompiler::CreateCodeCache(entry->module_script.Get(isolate_));
+  } else {
+    return false;
+  }
+  if (data == nullptr) {  // V8 cannot serialize this script (e.g. asm.js).
+    Debug("[compile cache] V8 produced no cache for %s %s\n",
+          entry->type_name(),
+          entry->source_filename);
+    return false;
+  }
   DCHECK_EQ(data->buffer_policy, ScriptCompiler::CachedData::BufferOwned);
-  entry->refreshed = true;
+  uint32_t size = static_cast<uint32_t>(data->length);
+  if (!IsLarger(size, entry->best_size)) {
+    Debug("[compile cache] cache for %s %s after execution is %d bytes, not "
+          "larger than %d, dropping it\n",
+          entry->type_name(),
+          entry->source_filename,
+          size,
+          entry->best_size);
+    delete data;
+    return false;
+  }
+  Debug("[compile cache] cache for %s %s after execution is %d bytes, was %d\n",
+        entry->type_name(),
+        entry->source_filename,
+        size,
+        entry->best_size);
   entry->cache.reset(data);
+  entry->best_size = size;
+  entry->refreshed = true;
+  entry->persisted = false;
+  return true;
+}
+
+void CompileCacheHandler::OnGCPrologue(Isolate* isolate,
+                                       GCType type,
+                                       GCCallbackFlags flags,
+                                       void* data) {
+  auto* handler = static_cast<CompileCacheHandler*>(data);
+  handler->mark_compacts_++;
+  if (handler->checkpoint_scheduled_ || handler->pending_checkpoint_.empty()) {
+    return;
+  }
+  CompileCacheEntry* oldest = handler->pending_checkpoint_.front();
+  if (handler->mark_compacts_ - oldest->compiled_at_gc <
+      handler->checkpoint_gcs_) {
+    return;
+  }
+  // The code cache cannot be produced during GC; do it once the current
+  // task is done, which also lets a module that is still being evaluated
+  // finish first.
+  handler->checkpoint_scheduled_ = true;
+  handler->env_->SetImmediate(
+      [handler](Environment* env) {
+        handler->checkpoint_scheduled_ = false;
+        handler->Checkpoint();
+      },
+      CallbackFlags::kUnrefed);
+}
+
+void CompileCacheHandler::Checkpoint() {
+  if (compile_cache_dir_.empty()) return;
+  HandleScope handle_scope(isolate_);
+  size_t captured = 0, written = 0;
+  while (!pending_checkpoint_.empty()) {
+    CompileCacheEntry* entry = pending_checkpoint_.front();
+    if (mark_compacts_ - entry->compiled_at_gc < checkpoint_gcs_) break;
+    pending_checkpoint_.pop_front();
+    if (!Capture(entry)) continue;
+    captured++;
+    if (WriteCacheFile(entry)) written++;
+    // The cache is on disk now; Persist() writes a larger one if the code
+    // keeps running. Keep only its size in memory.
+    entry->cache.reset();
+    entry->refreshed = false;
+  }
+  Debug("[compile cache] checkpoint at major GC %d: %zu larger caches, %zu "
+        "written\n",
+        mark_compacts_,
+        captured,
+        written);
 }
 
 void CompileCacheHandler::MaybeSave(CompileCacheEntry* entry,
@@ -394,6 +541,31 @@ void CompileCacheHandler::MaybeSave(CompileCacheEntry* entry,
  *   [uint32_t] cache hash
  *   .... compile cache content ....
  */
+uint32_t CompileCacheHandler::OnDiskCacheSize(CompileCacheEntry* entry) {
+  uv_fs_t req;
+  auto defer_req_cleanup = OnScopeLeave([&req]() { uv_fs_req_cleanup(&req); });
+  uv_file file = uv_fs_open(
+      nullptr, &req, entry->cache_filename.c_str(), O_RDONLY, 0, nullptr);
+  if (req.result < 0) return 0;
+  uv_fs_req_cleanup(&req);
+  auto defer_close = OnScopeLeave([file]() {
+    uv_fs_t close_req;
+    CHECK_EQ(0, uv_fs_close(nullptr, &close_req, file, nullptr));
+    uv_fs_req_cleanup(&close_req);
+  });
+  std::vector<uint32_t> headers(kHeaderCount);
+  uv_buf_t headers_buf = uv_buf_init(reinterpret_cast<char*>(headers.data()),
+                                     kHeaderCount * sizeof(uint32_t));
+  const int r = uv_fs_read(nullptr, &req, file, &headers_buf, 1, 0, nullptr);
+  if (r != static_cast<int>(headers_buf.len) ||
+      headers[kMagicNumberOffset] != kCacheMagicNumber ||
+      headers[kCodeSizeOffset] != entry->code_size ||
+      headers[kCodeHashOffset] != entry->code_hash) {
+    return 0;
+  }
+  return headers[kCacheSizeOffset];
+}
+
 void CompileCacheHandler::Persist() {
   DCHECK(!compile_cache_dir_.empty());
   if (read_only_) {
@@ -410,14 +582,20 @@ void CompileCacheHandler::Persist() {
   // finished. In that case, the off-thread writes should finish long
   // before any attempt of flushing is made so the method would then only
   // incur a negligible overhead from thread synchronization.
+  HandleScope handle_scope(isolate_);
   for (auto& pair : compiler_cache_store_) {
     auto* entry = pair.second.get();
     const char* type_name = entry->type_name();
+    if (entry->retained) {
+      Capture(entry);
+    }
     if (entry->cache == nullptr) {
-      Debug("[compile cache] skip persisting %s %s because the cache was not "
-            "initialized\n",
+      // After execution, a cache that did not grow is not kept in memory.
+      Debug("[compile cache] skip persisting %s %s because %s\n",
             type_name,
-            entry->source_filename);
+            entry->source_filename,
+            entry->best_size > 0 ? "cache was the same"
+                                 : "the cache was not initialized");
       continue;
     }
     if (entry->refreshed == false) {
@@ -434,12 +612,43 @@ void CompileCacheHandler::Persist() {
             entry->source_filename);
       continue;
     }
+    WriteCacheFile(entry);
+  }
 
+  // Clear the map at the end in one go instead of during the iteration to
+  // avoid rehashing costs.
+  Debug("[compile cache] Clear deserialized cache.\n");
+  pending_checkpoint_.clear();
+  compiler_cache_store_.clear();
+}
+
+bool CompileCacheHandler::WriteCacheFile(CompileCacheEntry* entry) {
+  const char* type_name = entry->type_name();
+  {
     DCHECK_EQ(entry->cache->buffer_policy,
               ScriptCompiler::CachedData::BufferOwned);
     char* cache_ptr =
         reinterpret_cast<char*>(const_cast<uint8_t*>(entry->cache->data));
     uint32_t cache_size = static_cast<uint32_t>(entry->cache->length);
+
+    // Other processes may have written a cache for the same code since this
+    // one read it (e.g. parallel workers exiting at once). Caches produced
+    // after execution only grow with the code that ran, so keep a file that
+    // is at least as large. A rejected cache is always replaced.
+    if (entry->type != CachedCodeType::kStrippedTypeScript &&
+        capture_mode_ == CaptureMode::kExecution && !entry->rejected) {
+      uint32_t on_disk = OnDiskCacheSize(entry);
+      if (on_disk > 0 && !IsLarger(cache_size, on_disk)) {
+        Debug("[compile cache] skip persisting %s %s because the cache on "
+              "disk is as large (%d bytes, this one %d)\n",
+              type_name,
+              entry->source_filename,
+              on_disk,
+              cache_size);
+        entry->persisted = true;
+        return false;
+      }
+    }
     uint32_t cache_hash = GetHash(cache_ptr, cache_size);
 
     // Generating headers.
@@ -473,7 +682,7 @@ void CompileCacheHandler::Persist() {
         nullptr, &mkstemp_req, cache_filename_tmp.c_str(), nullptr);
     if (err < 0) {
       Debug("failed. %s\n", uv_strerror(err));
-      continue;
+      return false;
     }
     Debug(" -> %s\n", mkstemp_req.path);
     Debug("[compile cache] writing cache for %s %s to temporary file %s [%d "
@@ -501,7 +710,7 @@ void CompileCacheHandler::Persist() {
         nullptr, &write_req, mkstemp_req.result, bufs, 2, 0, nullptr);
     if (err < 0) {
       Debug("failed: %s\n", uv_strerror(err));
-      continue;
+      return false;
     }
 
     uv_fs_t close_req;
@@ -511,7 +720,7 @@ void CompileCacheHandler::Persist() {
 
     if (err < 0) {
       Debug("failed: %s\n", uv_strerror(err));
-      continue;
+      return false;
     }
 
     Debug("success\n");
@@ -531,22 +740,43 @@ void CompileCacheHandler::Persist() {
                        nullptr);
     if (err < 0) {
       Debug("failed: %s\n", uv_strerror(err));
-      continue;
+      return false;
     }
     Debug("success\n");
     entry->persisted = true;
   }
-
-  // Clear the map at the end in one go instead of during the iteration to
-  // avoid rehashing costs.
-  Debug("[compile cache] Clear deserialized cache.\n");
-  compiler_cache_store_.clear();
+  return true;
 }
 
 CompileCacheHandler::CompileCacheHandler(Environment* env)
-    : isolate_(env->isolate()),
+    : env_(env),
+      isolate_(env->isolate()),
       is_debug_(
-          env->enabled_debug_list()->enabled(DebugCategory::COMPILE_CACHE)) {}
+          env->enabled_debug_list()->enabled(DebugCategory::COMPILE_CACHE)) {
+  std::string value;
+  if (credentials::SafeGetenv("NODE_COMPILE_CACHE_CAPTURE", &value, env) &&
+      value == "compile") {
+    capture_mode_ = CaptureMode::kCompile;
+  }
+  if (credentials::SafeGetenv("NODE_COMPILE_CACHE_REFRESH", &value, env) &&
+      !value.empty()) {
+    refresh_interval_ =
+        static_cast<uint32_t>(strtoul(value.c_str(), nullptr, 10));
+  }
+  refresh_seed_ = static_cast<uint32_t>(uv_hrtime() ^ uv_os_getpid());
+  if (credentials::SafeGetenv(
+          "NODE_COMPILE_CACHE_CHECKPOINT_GCS", &value, env) &&
+      !value.empty()) {
+    checkpoint_gcs_ =
+        static_cast<uint32_t>(strtoul(value.c_str(), nullptr, 10));
+  }
+}
+
+CompileCacheHandler::~CompileCacheHandler() {
+  if (gc_callback_added_) {
+    isolate_->RemoveGCPrologueCallback(OnGCPrologue, this);
+  }
+}
 
 // Directory structure:
 // - Compile cache directory (from NODE_COMPILE_CACHE)
@@ -626,6 +856,16 @@ CompileCacheEnableResult CompileCacheHandler::Enable(Environment* env,
   compile_cache_dir_ = cache_dir_with_tag;
   portable_ = option;
   read_only_ = read_only;
+  if (capture_mode_ == CaptureMode::kExecution && !read_only_ &&
+      checkpoint_gcs_ > 0 && !gc_callback_added_) {
+    isolate_->AddGCPrologueCallback(
+        OnGCPrologue, this, v8::kGCTypeMarkSweepCompact);
+    gc_callback_added_ = true;
+  }
+  Debug("[compile cache] producing caches %s\n",
+        read_only_                               ? "never (read-only)"
+        : capture_mode_ == CaptureMode::kCompile ? "at compilation"
+                                                 : "after execution");
   if (HasOption(option, EnableOption::PORTABLE)) {
     normalized_compile_cache_dir_ =
         NormalizeFileURLOrPath(env, compile_cache_dir_);

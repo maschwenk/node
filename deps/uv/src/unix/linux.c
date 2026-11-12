@@ -654,21 +654,47 @@ int uv__platform_loop_init(uv_loop_t* loop) {
 }
 
 
+struct uv__invalidate;
+static void uv__io_fork_invalidate_events(uv_loop_t* loop);
+
 int uv__io_fork(uv_loop_t* loop) {
   int err;
+  int old_fd;
   struct watcher_list* root;
 
   root = uv__inotify_watchers(loop)->rbh_root;
 
-  uv__close(loop->backend_fd);
+  /* fork() may have been called from a callback that uv__io_poll() is
+   * dispatching. The rest of the events that the parent's epoll_pwait()
+   * returned are the parent's: don't let the child dispatch them.
+   */
+  uv__io_fork_invalidate_events(loop);
+
+  old_fd = loop->backend_fd;
   loop->backend_fd = -1;
 
   /* TODO(bnoordhuis) Loses items from the submission and completion rings. */
   uv__platform_loop_delete(loop);
 
   err = uv__platform_loop_init(loop);
-  if (err)
+  if (err) {
+    uv__close(old_fd);
     return err;
+  }
+
+  /* Give the new epoll instance the old file descriptor number. A
+   * uv__io_poll() call that is still on the stack (fork() from a callback)
+   * keeps using the number it read on entry; with a new number, that could
+   * by then be another loop's epoll instance (another thread's), or any
+   * other file.
+   */
+  if (dup3(loop->backend_fd, old_fd, O_CLOEXEC) == -1) {
+    err = UV__ERR(errno);
+    uv__close(old_fd);
+    return err;
+  }
+  uv__close(loop->backend_fd);
+  loop->backend_fd = old_fd;
 
   return uv__inotify_fork(loop, root);
 }
@@ -694,6 +720,19 @@ struct uv__invalidate {
   struct epoll_event* events;
   int nfds;
 };
+
+
+static void uv__io_fork_invalidate_events(uv_loop_t* loop) {
+  uv__loop_internal_fields_t* lfields;
+  struct uv__invalidate* inv;
+  int i;
+
+  lfields = uv__get_internal_fields(loop);
+  inv = lfields->inv;
+  if (inv != NULL)
+    for (i = 0; i < inv->nfds; i++)
+      inv->events[i].data.fd = -1;
+}
 
 
 void uv__platform_invalidate_fd(uv_loop_t* loop, int fd) {

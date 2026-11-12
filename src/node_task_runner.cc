@@ -1,6 +1,7 @@
 #include "node_task_runner.h"
 #include "simdjson.h"
 #include "util-inl.h"
+#include "v8-fork.h"
 
 #include <regex>  // NOLINT(build/c++11)
 
@@ -214,6 +215,9 @@ void ProcessRunner::Run() {
   // keeps the string alive until destructor
   cwd_ = ConvertPathToUTF8(package_json_path_.parent_path());
   options_.cwd = cwd_.c_str();
+  // A fork that is followed by exec: let it skip the heap again if
+  // process.forkSelf() made the heap copyable.
+  v8::MakeMappingsUnforkable();
   if (int r = uv_spawn(loop_, &process_, &options_)) {
     fprintf(stderr, "Error: %s\n", uv_strerror(r));
   }

@@ -97,6 +97,36 @@ void* BoundedPageAllocator::AllocatePages(size_t size, size_t alignment,
   return nullptr;
 }
 
+void* BoundedPageAllocator::AllocatePagesFromTop(
+    size_t size, PageAllocator::Permission access) {
+  MutexGuard guard(&mutex_);
+  DCHECK(IsAligned(size, allocate_page_size_));
+
+  Address address = region_allocator_.AllocateRegionFromTop(size);
+  if (address == RegionAllocator::kAllocationFailure) {
+    allocation_status_ = AllocationStatus::kRanOutOfReservation;
+    return nullptr;
+  }
+
+  void* ptr = reinterpret_cast<void*>(address);
+  if (access == PageAllocator::kNoAccess ||
+      access == PageAllocator::kNoAccessWillJitLater) {
+    allocation_status_ = AllocationStatus::kSuccess;
+    return ptr;
+  }
+  bool committed =
+      page_initialization_mode_ == PageInitializationMode::kRecommitOnly
+          ? page_allocator_->RecommitPages(ptr, size, access)
+          : page_allocator_->SetPermissions(ptr, size, access);
+  if (committed) {
+    allocation_status_ = AllocationStatus::kSuccess;
+    return ptr;
+  }
+  CHECK_EQ(region_allocator_.FreeRegion(address), size);
+  allocation_status_ = AllocationStatus::kFailedToCommit;
+  return nullptr;
+}
+
 bool BoundedPageAllocator::AllocatePagesAt(Address address, size_t size,
                                            PageAllocator::Permission access) {
   MutexGuard guard(&mutex_);

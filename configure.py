@@ -1259,6 +1259,22 @@ parser.add_argument('--v8-disable-maglev',
     default=None,
     help=f"Disable V8's Maglev compiler. {maglev_enabled_by_default_help}")
 
+parser.add_argument('--v8-enable-builtins-profiling',
+    action='store_true',
+    dest='v8_enable_builtins_profiling',
+    default=None,
+    help='Instrument the embedded builtins with basic block counters. Run the '
+         'resulting binary with --turbo-profiling-output=<file> to collect them, '
+         'then turn them into branch hints with '
+         'deps/v8/tools/builtins-pgo/get_hints.py.')
+
+parser.add_argument('--v8-builtins-profiling-log-file',
+    action='store',
+    dest='v8_builtins_profiling_log_file',
+    default=None,
+    help='Branch hints file for the embedded builtins (builtins PGO), as made by '
+         'deps/v8/tools/builtins-pgo/get_hints.py from a profiling build.')
+
 parser.add_argument('--v8-enable-short-builtin-calls',
     action='store_true',
     dest='v8_enable_short_builtin_calls',
@@ -2292,6 +2308,15 @@ def configure_v8(o, configs):
   if flavor != 'linux' and options.v8_enable_hugepage:
     raise Exception('--v8-enable-hugepage is supported only on linux.')
   o['variables']['v8_enable_hugepage'] = 1 if options.v8_enable_hugepage else 0
+  if options.v8_enable_builtins_profiling and options.v8_builtins_profiling_log_file:
+    raise Exception('--v8-enable-builtins-profiling and '
+                    '--v8-builtins-profiling-log-file are mutually exclusive.')
+  o['variables']['v8_enable_builtins_profiling'] = 1 if options.v8_enable_builtins_profiling else 0
+  if options.v8_builtins_profiling_log_file:
+    log_file = os.path.abspath(options.v8_builtins_profiling_log_file)
+    if not os.path.isfile(log_file):
+      raise Exception(f'Builtins profile not found: {log_file}')
+    o['variables']['v8_builtins_profiling_log_file'] = log_file
   if options.v8_enable_short_builtin_calls or o['variables']['target_arch'] == 'x64':
     o['variables']['v8_enable_short_builtin_calls'] = 1
   if options.v8_enable_snapshot_compression:

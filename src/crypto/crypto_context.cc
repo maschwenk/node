@@ -1109,6 +1109,23 @@ X509_STORE* NewRootCertStore(Environment* env) {
   return store;
 }
 
+void JoinCertificateLoadingThreads() {
+  {
+    Mutex::ScopedLock lock(start_cert_loading_thread_mutex);
+    if (cert_loading_thread_started.load()) {
+      uv_thread_join(&cert_loading_thread);
+      cert_loading_thread_started.store(false);
+    }
+  }
+  {
+    Mutex::ScopedLock lock(start_system_cert_loading_thread_mutex);
+    if (system_cert_loading_thread_started.load()) {
+      uv_thread_join(&system_cert_loading_thread);
+      system_cert_loading_thread_started.store(false);
+    }
+  }
+}
+
 void CleanupCachedRootCertificates() {
   // Serialize with starters to avoid the race window.
   {

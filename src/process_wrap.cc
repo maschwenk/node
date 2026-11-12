@@ -26,6 +26,7 @@
 #include "stream_base-inl.h"
 #include "stream_wrap.h"
 #include "util-inl.h"
+#include "v8-fork.h"
 
 #include <climits>
 #include <cstdlib>
@@ -326,6 +327,9 @@ class ProcessWrap : public HandleWrap {
     }
 
     if (err == 0) {
+      // A fork that is followed by exec: let it skip the heap again if
+      // process.forkSelf() made the heap copyable.
+      v8::MakeMappingsUnforkable();
       err = uv_spawn(env->event_loop(), &wrap->process_, &options);
       wrap->MarkAsInitialized();
     }

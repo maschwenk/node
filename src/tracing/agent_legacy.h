@@ -85,6 +85,7 @@ class LegacyTracingAgent final : public Agent {
                               std::unique_ptr<AsyncTraceWriter> writer,
                               enum UseDefaultCategoryMode mode);
   std::string GetEnabledCategories() const override;
+  bool IsThreadRunning() const override { return started_; }
   void AppendTraceEvent(TraceObject* trace_event);
   void AddMetadataEvent(std::unique_ptr<TraceObject> event);
   void Flush(bool blocking);

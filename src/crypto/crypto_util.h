@@ -77,6 +77,11 @@ void InitCrypto(v8::Local<v8::Object> target);
 
 extern void UseExtraCaCerts(std::string_view file);
 void CleanupCachedRootCertificates();
+// For process.forkSelf(): waits for the threads that load CA certificates off
+// the main thread, if they were started, so that they neither run (half way
+// through initializing the certificate caches) at the instant of fork(2) nor
+// are joined again later, which the child could not do.
+void JoinCertificateLoadingThreads();
 
 int PasswordCallback(char* buf, int size, int rwflag, void* u);
 int NoPasswordCallback(char* buf, int size, int rwflag, void* u);

@@ -81,6 +81,11 @@ class V8_BASE_EXPORT RegionAllocator final {
   // Same as above but tries to randomize the region displacement.
   Address AllocateRegion(RandomNumberGenerator* rng, size_t size);
 
+  // Allocates region of |size| (must be |page_size|-aligned) at the highest
+  // address where it fits. Returns the address of the region on success or
+  // kAllocationFailure.
+  Address AllocateRegionFromTop(size_t size);
+
   // Allocates region of |size| at |requested_address| if it's free. Both the
   // address and the size must be |page_size|-aligned. On success returns
   // true.

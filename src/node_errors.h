@@ -93,6 +93,8 @@ void OOMErrorHandler(const char* location, const v8::OOMDetails& details);
   V(ERR_FS_CP_SOCKET, Error)                                                   \
   V(ERR_FS_CP_FIFO_PIPE, Error)                                                \
   V(ERR_FS_CP_UNKNOWN, Error)                                                  \
+  V(ERR_FORK_SELF_BUSY, Error)                                                 \
+  V(ERR_FORK_SELF_UNSAFE, Error)                                               \
   V(ERR_HEAP_PROFILE_HAVE_BEEN_STARTED, Error)                                 \
   V(ERR_HEAP_PROFILE_NOT_STARTED, Error)                                       \
   V(ERR_ILLEGAL_CONSTRUCTOR, Error)                                            \
