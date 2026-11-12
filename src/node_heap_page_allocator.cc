@@ -52,7 +52,17 @@
 //    and MADV_DONTNEED, as V8 does) once nothing in it is in use. Freed
 //    chunks in a region that is still in use stay mapped read-write: they
 //    do not fault on access until the whole region is freed, like the pages
-//    V8 keeps in its own page pool.
+//    V8 keeps in its own page pool. Once a region is less than half in use,
+//    its freed pages go back to the kernel right away instead
+//    (NODE_HEAP_HUGEPAGES_SPARSE=<pages> sets the threshold).
+//  - Large objects: V8 commits each one's chunk rounded up to 256 KiB but
+//    touches only the object, so a huge page would make the rest resident.
+//    Node sets V8's --large-objects-at-cage-top, which allocates them from
+//    the top of the cage, and commits only the lower half of the cage, where
+//    regular pages go, in whole regions; the upper half is left to V8's
+//    allocator (NODE_HEAP_HUGEPAGES_LO_TOP=0 manages the whole cage).
+//  - WebAssembly memories are large kNoAccess reservations too, but only
+//    64 KiB-aligned, and rely on uncommitted pages faulting: never cages.
 //  - A freed chunk handed out again before its region was given back is
 //    cleared first, so V8 always gets zeroed memory, as it does from a fresh
 //    mapping (the V8 cage allows uninitialized pages; cppgc's does not).
@@ -87,6 +97,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <map>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -229,7 +240,9 @@ bool TestBit(const uint64_t* words, size_t bit) {
   V(cage_region_commit_failed)                                                 \
   V(cage_region_release)                                                       \
   V(cage_region_release_split)                                                 \
-  V(cage_pages_cleared)
+  V(cage_pages_cleared)                                                        \
+  V(cage_sparse_release)                                                       \
+  V(cage_sparse_pages_released)
 
 enum Counter {
 #define V(name) k_##name,
@@ -291,12 +304,16 @@ class HeapPageAllocator final : public v8::PageAllocator {
                     bool honor_discard,
                     bool advise_large,
                     CageMode cage_mode,
+                    bool large_objects_at_top,
+                    size_t sparse_pages,
                     std::string stats_dir)
       : use_arenas_(use_arenas),
         arena_size_(arena_size),
         honor_discard_(honor_discard),
         advise_large_(advise_large),
         cage_mode_(cage_mode),
+        large_objects_at_top_(large_objects_at_top),
+        sparse_pages_(sparse_pages),
         stats_dir_(std::move(stats_dir)) {}
 
   size_t AllocatePageSize() override { return default_.AllocatePageSize(); }
@@ -361,7 +378,8 @@ class HeapPageAllocator final : public v8::PageAllocator {
       }
       uintptr_t start = reinterpret_cast<uintptr_t>(address);
       if (Cage* cage = FindCage(start)) {
-        if (start == cage->start && length >= cage->end - cage->start) {
+        if (start == cage->start &&
+            length >= cage->reservation_end - cage->start) {
           DropCage(cage);
         } else {
           // Not expected: V8 frees cage memory with SetPermissions().
@@ -436,10 +454,17 @@ class HeapPageAllocator final : public v8::PageAllocator {
       }
       if (Cage* cage = FindCage(start)) {
         ZeroList zero;
+        uintptr_t above = Above(cage, start, length);
         bool result = CageSetPermissions(cage, start, length, permissions, &zero);
         if (cage_mode_ == CageMode::kOn) {
           lock.unlock();
           ClearRanges(zero);
+          if (above != 0) {
+            result = default_.SetPermissions(reinterpret_cast<void*>(above),
+                                             start + length - above,
+                                             permissions) &&
+                     result;
+          }
           MaybeWriteStats();
           return result;
         }
@@ -447,7 +472,9 @@ class HeapPageAllocator final : public v8::PageAllocator {
       }
     }
     Count(k_perm_pass);
-    return default_.SetPermissions(address, length, permissions);
+    bool result = default_.SetPermissions(address, length, permissions);
+    if (cage_mode_ == CageMode::kCount) MaybeWriteStats();
+    return result;
   }
 
   bool RecommitPages(void* address,
@@ -468,10 +495,17 @@ class HeapPageAllocator final : public v8::PageAllocator {
         Count(k_cage_recommit);
         RecordCageShape(kOpRecommit, length);
         ZeroList zero;
+        uintptr_t above = Above(cage, start, length);
         bool result = CageSetPermissions(cage, start, length, permissions, &zero);
         if (cage_mode_ == CageMode::kOn) {
           lock.unlock();
           ClearRanges(zero);
+          if (above != 0) {
+            result = default_.RecommitPages(reinterpret_cast<void*>(above),
+                                            start + length - above,
+                                            permissions) &&
+                     result;
+          }
           return result;
         }
       }
@@ -497,13 +531,18 @@ class HeapPageAllocator final : public v8::PageAllocator {
       }
       if (Cage* cage = FindCage(start)) {
         RecordCageShape(kOpDiscard, size);
+        uintptr_t above = Above(cage, start, size);
         if (!honor_discard_) {
           Count(k_cage_discard_ignored);
           if (cage_mode_ == CageMode::kOn) return true;
         } else {
           Count(k_cage_discard);
           CageDiscard(cage, start, size);
-          if (cage_mode_ == CageMode::kOn) return true;
+          if (cage_mode_ == CageMode::kOn) {
+            return above == 0 ||
+                   default_.DiscardSystemPages(reinterpret_cast<void*>(above),
+                                               start + size - above);
+          }
         }
       }
     }
@@ -536,8 +575,14 @@ class HeapPageAllocator final : public v8::PageAllocator {
       if (Cage* cage = FindCage(start)) {
         Count(k_cage_decommit);
         RecordCageShape(kOpDecommit, size);
+        uintptr_t above = Above(cage, start, size);
         bool result = CageDecommit(cage, start, size);
-        if (cage_mode_ == CageMode::kOn) return result;
+        if (cage_mode_ == CageMode::kOn) {
+          return (above == 0 ||
+                  default_.DecommitPages(reinterpret_cast<void*>(above),
+                                         start + size - above)) &&
+                 result;
+        }
       }
     }
     Count(k_decommit_pass);
@@ -577,7 +622,8 @@ class HeapPageAllocator final : public v8::PageAllocator {
     char line[256];
     snprintf(line,
              sizeof(line),
-             "pid %d mode %s discard %d large %d arena_mib %zu cage %s\n",
+             "pid %d mode %s discard %d large %d arena_mib %zu cage %s "
+             "lo_top %d sparse %zu\n",
              static_cast<int>(getpid()),
              use_arenas_ ? "arena" : "count",
              honor_discard_ ? 1 : 0,
@@ -585,7 +631,9 @@ class HeapPageAllocator final : public v8::PageAllocator {
              arena_size_ >> 20,
              cage_mode_ == CageMode::kOn
                  ? "on"
-                 : (cage_mode_ == CageMode::kCount ? "count" : "off"));
+                 : (cage_mode_ == CageMode::kCount ? "count" : "off"),
+             large_objects_at_top_ ? 1 : 0,
+             sparse_pages_);
     text += line;
     for (int i = 0; i < kCounterCount; i++) {
       snprintf(line,
@@ -637,6 +685,22 @@ class HeapPageAllocator final : public v8::PageAllocator {
                peak_live_pages_,
                split_cage_regions);
       text += line;
+      if (cage_mode_ == CageMode::kCount) {
+        std::string residency = ResidencyReport();
+        text += residency;
+        if (residency_gap_ > max_residency_gap_) {
+          max_residency_gap_ = residency_gap_;
+          max_gap_report_ = residency;
+        }
+        // The same lines, from the write where whole regions would have
+        // added the most memory over what is resident now.
+        size_t start = 0;
+        while (start < max_gap_report_.size()) {
+          size_t end = max_gap_report_.find('\n', start);
+          text += "max_gap_" + max_gap_report_.substr(start, end + 1 - start);
+          start = end + 1;
+        }
+      }
       for (const CageShape& shape : cage_shapes_) {
         snprintf(line,
                  sizeof(line),
@@ -702,9 +766,16 @@ class HeapPageAllocator final : public v8::PageAllocator {
 
   struct Cage {
     uintptr_t start;
-    uintptr_t end;
+    uintptr_t end;  // End of the part committed in whole regions.
     CageRegion* regions;
+    uintptr_t reservation_end;
   };
+
+  // The part of [start, start + length) above the managed part of |cage|,
+  // which is passed to V8's allocator.
+  static uintptr_t Above(const Cage* cage, uintptr_t start, size_t length) {
+    return start + length > cage->end ? cage->end : 0;
+  }
 
   struct ZeroRange {
     uintptr_t start;
@@ -724,16 +795,22 @@ class HeapPageAllocator final : public v8::PageAllocator {
   void AdoptCage(uintptr_t start, size_t length) {
     // calloc() maps large blocks fresh, so the bookkeeping of regions V8
     // never uses is never touched.
+    // With large objects at the top of the cage (V8's
+    // --large-objects-at-cage-top), only the lower half, where regular pages
+    // go, is committed in whole regions; the upper half is left to V8's
+    // allocator, so large objects do not pull the untouched rest of their
+    // chunks onto huge pages.
+    size_t managed = large_objects_at_top_ ? length / 2 : length;
     CageRegion* regions = static_cast<CageRegion*>(
-        calloc(length / kRegionSize, sizeof(CageRegion)));
+        calloc(managed / kRegionSize, sizeof(CageRegion)));
     if (regions == nullptr) return;  // Stays an ordinary reservation.
     if (ApplyCage()) {
-      // One call for the whole reservation; the read-write ranges carved out
+      // One call for the whole managed part; the read-write ranges carved out
       // of it later keep the flag.
-      madvise(reinterpret_cast<void*>(start), length, MADV_HUGEPAGE);
+      madvise(reinterpret_cast<void*>(start), managed, MADV_HUGEPAGE);
     }
     std::lock_guard<std::mutex> lock(mutex_);
-    cages_.push_back({start, start + length, regions});
+    cages_.push_back({start, start + managed, regions, start + length});
     Count(k_cage_adopt);
   }
 
@@ -755,6 +832,8 @@ class HeapPageAllocator final : public v8::PageAllocator {
       }
     }
     free(cage->regions);
+    chunks_.erase(chunks_.lower_bound(cage->start),
+                  chunks_.lower_bound(cage->end));
     cages_.erase(cages_.begin() + (cage - cages_.data()));
     Count(k_cage_free);
   }
@@ -936,12 +1015,14 @@ class HeapPageAllocator final : public v8::PageAllocator {
           }
           AddLive(region, from, to);
         });
+    if (TrackingChunks()) TrackChunk(start, length);
     UpdatePeaks();
     return ok;
   }
 
   // Requires mutex_. V8 frees [start, start + length).
   void CageNoAccess(Cage* cage, uintptr_t start, size_t length) {
+    if (TrackingChunks()) UntrackChunk(start, length);
     ForEachCageRegion(
         cage,
         start,
@@ -967,7 +1048,34 @@ class HeapPageAllocator final : public v8::PageAllocator {
             }
           }
           SetBits(region.stale, from, to);
+          if (region.live_count < sparse_pages_) GiveBackStale(region, base);
         });
+  }
+
+  // Requires mutex_. The region is mostly free: give the freed pages back to
+  // the kernel now, as V8's allocator would have, instead of keeping them
+  // until the whole region is free. This splits the region's huge page.
+  void GiveBackStale(CageRegion& region, uintptr_t base) {
+    for (size_t page = 0; page < kCagePagesPerRegion;) {
+      if (!TestBit(region.stale, page)) {
+        page++;
+        continue;
+      }
+      size_t end = page;
+      while (end < kCagePagesPerRegion && TestBit(region.stale, end)) end++;
+      if (ApplyCage()) {
+        CHECK_EQ(madvise(PageAddress(base, page),
+                         (end - page) * kCagePageSize,
+                         MADV_DONTNEED),
+                 0);
+      }
+      counters_[k_cage_sparse_pages_released].fetch_add(
+          end - page, std::memory_order_relaxed);
+      page = end;
+    }
+    memset(region.stale, 0, sizeof(region.stale));
+    region.split = true;
+    Count(k_cage_sparse_release);
   }
 
   // Requires mutex_. As V8's DecommitPages(): inaccessible, zero when made
@@ -1016,6 +1124,100 @@ class HeapPageAllocator final : public v8::PageAllocator {
           ClearBits(region.stale, from, to);
           region.split = true;
         });
+  }
+
+  // Count mode with stats only: the chunks V8 has made accessible, to see how
+  // much of each is resident when V8's allocator commits it.
+  bool TrackingChunks() const {
+    return cage_mode_ == CageMode::kCount && !stats_dir_.empty();
+  }
+
+  // Requires mutex_.
+  void TrackChunk(uintptr_t start, size_t length) {
+    if (chunks_.count(start) == 0) chunks_[start] = {length, length};
+  }
+
+  // Requires mutex_. V8 frees a whole chunk, or the tail of a large object.
+  void UntrackChunk(uintptr_t start, size_t length) {
+    auto it = chunks_.upper_bound(start);
+    if (it == chunks_.begin()) return;
+    --it;
+    if (it->first == start) {
+      chunks_.erase(it);
+    } else if (start < it->first + it->second.length) {
+      it->second.length = start - it->first;
+    }
+  }
+
+  // Requires mutex_. With V8's own allocator (count mode): resident pages of
+  // the accessible chunks, by kind, and how many pages whole 2 MiB regions
+  // would add over that.
+  std::string ResidencyReport() {
+    struct Kind {
+      const char* name;
+      size_t chunks, pages, resident;
+    };
+    Kind kinds[] = {{"page", 0, 0, 0},      // one 256 KiB chunk
+                    {"large", 0, 0, 0},     // larger chunk (large object)
+                    {"shrunk", 0, 0, 0},    // large object whose tail was freed
+                    {"other", 0, 0, 0}};
+    size_t histogram[5] = {};  // resident share of "page" chunks, by quarter
+    std::vector<unsigned char> vector;
+    size_t resident_total = 0;
+    for (const auto& entry : chunks_) {
+      const TrackedChunk& chunk = entry.second;
+      size_t pages = chunk.length / kCagePageSize;
+      if (pages == 0) continue;
+      vector.resize(pages);
+      if (mincore(reinterpret_cast<void*>(entry.first),
+                  chunk.length,
+                  vector.data()) != 0) {
+        continue;
+      }
+      size_t resident = 0;
+      for (unsigned char v : vector) resident += v & 1;
+      int kind = chunk.length != chunk.original ? 2
+                 : chunk.original == kBlockSize ? 0
+                 : chunk.original > kBlockSize  ? 1
+                                                : 3;
+      kinds[kind].chunks++;
+      kinds[kind].pages += pages;
+      kinds[kind].resident += resident;
+      resident_total += resident;
+      if (kind == 0) histogram[resident == pages ? 4 : resident * 4 / pages]++;
+    }
+    size_t committed_pages = committed_regions_ * kCagePagesPerRegion;
+    residency_gap_ =
+        committed_pages > resident_total ? committed_pages - resident_total : 0;
+    std::string text;
+    char line[256];
+    snprintf(line,
+             sizeof(line),
+             "residency region_pages %zu live_pages %zu resident_pages %zu\n",
+             committed_pages,
+             live_pages_,
+             resident_total);
+    text += line;
+    for (const Kind& kind : kinds) {
+      snprintf(line,
+               sizeof(line),
+               "residency_kind %s chunks %zu pages %zu resident %zu\n",
+               kind.name,
+               kind.chunks,
+               kind.pages,
+               kind.resident);
+      text += line;
+    }
+    snprintf(line,
+             sizeof(line),
+             "residency_page_quarters %zu %zu %zu %zu full %zu\n",
+             histogram[0],
+             histogram[1],
+             histogram[2],
+             histogram[3],
+             histogram[4]);
+    text += line;
+    return text;
   }
 
   // Requires mutex_.
@@ -1245,6 +1447,9 @@ class HeapPageAllocator final : public v8::PageAllocator {
   const bool honor_discard_;
   const bool advise_large_;
   const CageMode cage_mode_;
+  const bool large_objects_at_top_;
+  // A region with fewer live pages than this gives freed pages back at once.
+  const size_t sparse_pages_;
   const std::string stats_dir_;
 
   std::mutex mutex_;
@@ -1255,6 +1460,14 @@ class HeapPageAllocator final : public v8::PageAllocator {
   size_t live_pages_at_peak_ = 0;
   size_t peak_live_pages_ = 0;
   std::vector<CageShape> cage_shapes_;
+  struct TrackedChunk {
+    size_t length;
+    size_t original;
+  };
+  std::map<uintptr_t, TrackedChunk> chunks_;  // count mode with stats only
+  size_t residency_gap_ = 0;
+  size_t max_residency_gap_ = 0;
+  std::string max_gap_report_;
   std::vector<Arena> arenas_;
   size_t live_blocks_ = 0;
   size_t peak_blocks_ = 0;
@@ -1307,6 +1520,24 @@ HeapPageAllocator* CreateFromEnvironment() {
     // 2 MiB is the huge page size only with 4 KiB base pages.
     cage_mode = CageMode::kOff;
   }
+  // Large objects go to the top half of each cage, which is left on small
+  // pages (on by default with cage mode, NODE_HEAP_HUGEPAGES_LO_TOP=0 turns it
+  // off; =1 also turns it on in count mode).
+  bool large_objects_at_top = cage_mode == CageMode::kOn;
+  if (credentials::SafeGetenv("NODE_HEAP_HUGEPAGES_LO_TOP", &value)) {
+    large_objects_at_top = cage_mode != CageMode::kOff && value == "1";
+  }
+  if (large_objects_at_top) {
+    v8::V8::SetFlagsFromString("--large-objects-at-cage-top");
+  }
+  // Freed pages in a region that is less than half in use go back to the
+  // kernel right away (NODE_HEAP_HUGEPAGES_SPARSE=<pages>, 0 keeps them until
+  // the whole region is free).
+  size_t sparse_pages = kCagePagesPerRegion / 2;
+  if (credentials::SafeGetenv("NODE_HEAP_HUGEPAGES_SPARSE", &value)) {
+    sparse_pages = std::min<size_t>(strtoull(value.c_str(), nullptr, 10),
+                                    kCagePagesPerRegion);
+  }
   std::string stats_dir;
   credentials::SafeGetenv("NODE_HEAP_HUGEPAGES_STATS", &stats_dir);
   HeapPageAllocator* allocator = new HeapPageAllocator(use_arenas,
@@ -1314,6 +1545,8 @@ HeapPageAllocator* CreateFromEnvironment() {
                                                        honor_discard,
                                                        advise_large,
                                                        cage_mode,
+                                                       large_objects_at_top,
+                                                       sparse_pages,
                                                        std::move(stats_dir));
   heap_page_allocator = allocator;
   atexit(WriteStatsAtExit);
