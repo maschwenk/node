@@ -38,6 +38,9 @@ class LiteralBuffer final {
     AddTwoByteChar(code_unit);
   }
 
+  // Same as calling AddChar() for each code unit.
+  void AddChars(base::Vector<const uint16_t> code_units);
+
   bool is_one_byte() const { return is_one_byte_; }
 
   bool Equals(base::Vector<const char> keyword) const {
@@ -72,6 +75,10 @@ class LiteralBuffer final {
   template <typename IsolateT>
   DirectHandle<String> Internalize(IsolateT* isolate) const;
 
+  // Returns the literal as a new string that is not internalized.
+  template <typename IsolateT>
+  DirectHandle<String> NewString(IsolateT* isolate) const;
+
  private:
   static constexpr int kInitialCapacity = 256;
   static constexpr int kGrowthFactor = 4;
@@ -95,6 +102,8 @@ class LiteralBuffer final {
   void AddTwoByteChar(base::uc32 code_unit);
   int NewCapacity(int min_capacity);
   V8_NOINLINE V8_PRESERVE_MOST void ExpandBuffer();
+  void EnsureCapacity(int min_capacity);
+  void ResizeBuffer(int capacity);
   void ConvertToTwoByte();
 
   base::Vector<uint8_t> backing_store_;

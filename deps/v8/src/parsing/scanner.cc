@@ -274,6 +274,31 @@ void ProcessPerFunctionCompileHints(const base::Vector<const uint8_t>& data,
   positions.shrink_to_fit();
 }
 
+// Returns the first code unit in [begin, end) that ends a magic comment value,
+// that is whitespace or a line terminator, or end if there is none.
+const uint16_t* FindEndOfMagicCommentValue(const uint16_t* begin,
+                                           const uint16_t* end) {
+  auto ends_value = [](uint16_t c) { return IsWhiteSpaceOrLineTerminator(c); };
+  // Values can be megabytes of base64 (inline source maps), and printable
+  // ASCII other than space never ends a value: skip blocks of it with a loop
+  // the compiler can vectorize, and only look closer at blocks with other
+  // code units.
+  constexpr int kBlockSize = 16;
+  while (end - begin >= kBlockSize) {
+    bool maybe_ends_value = false;
+    for (int i = 0; i < kBlockSize; i++) {
+      maybe_ends_value |= static_cast<uint16_t>(begin[i] - 0x21) > 0x7E - 0x21;
+    }
+    if (V8_UNLIKELY(maybe_ends_value)) {
+      const uint16_t* block_end = begin + kBlockSize;
+      const uint16_t* result = std::find_if(begin, block_end, ends_value);
+      if (result != block_end) return result;
+    }
+    begin += kBlockSize;
+  }
+  return std::find_if(begin, end, ends_value);
+}
+
 }  // namespace
 
 void Scanner::TryToParseMagicComment(base::uc32 hash_or_at_sign) {
@@ -322,12 +347,15 @@ void Scanner::TryToParseMagicComment(base::uc32 hash_or_at_sign) {
   while (IsWhiteSpace(c0_)) {
     Advance();
   }
-  while (c0_ != kEndOfInput && !unibrow::IsLineTerminator(c0_)) {
-    if (IsWhiteSpace(c0_)) {
-      break;
-    }
+  // The value ends at whitespace or a line terminator. Copy it a buffer at a
+  // time rather than a character at a time, since it can be long.
+  if (c0_ != kEndOfInput && !IsWhiteSpaceOrLineTerminator(c0_)) {
     value->AddChar(c0_);
-    Advance();
+    AdvanceUntil(FindEndOfMagicCommentValue,
+                 [value](const uint16_t* begin, const uint16_t* end) {
+                   value->AddChars(base::Vector<const uint16_t>(
+                       begin, static_cast<size_t>(end - begin)));
+                 });
   }
   // Allow whitespace at the end.
   while (c0_ != kEndOfInput && !unibrow::IsLineTerminator(c0_)) {
@@ -703,7 +731,9 @@ template DirectHandle<String> Scanner::SourceUrl(LocalIsolate* isolate) const;
 template <typename IsolateT>
 DirectHandle<String> Scanner::SourceMappingUrl(IsolateT* isolate) const {
   DirectHandle<String> tmp;
-  if (source_mapping_url_.length() > 0) {
+  if (source_mapping_url_.length() > kMaxInternalizedSourceMappingUrlLength) {
+    tmp = source_mapping_url_.NewString(isolate);
+  } else if (source_mapping_url_.length() > 0) {
     tmp = source_mapping_url_.Internalize(isolate);
   }
   return tmp;

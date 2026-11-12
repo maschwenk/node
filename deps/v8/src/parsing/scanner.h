@@ -75,12 +75,26 @@ class Utf16CharacterStream {
   // returns kEndOfInput.
   template <typename FunctionType>
   V8_INLINE base::uc32 AdvanceUntil(FunctionType check) {
-    while (true) {
-      auto next_cursor_pos =
-          std::find_if(buffer_cursor_, buffer_end_, [&check](uint16_t raw_c0_) {
+    return AdvanceUntil(
+        [&check](const uint16_t* begin, const uint16_t* end) {
+          return std::find_if(begin, end, [&check](uint16_t raw_c0_) {
             base::uc32 c0_ = static_cast<base::uc32>(raw_c0_);
             return check(c0_);
           });
+        },
+        [](const uint16_t*, const uint16_t*) {});
+  }
+
+  // Like AdvanceUntil(check), but a buffer at a time: |find(begin, end)|
+  // returns the first code unit in [begin, end) that meets the requirement,
+  // or end, and |skipped(begin, end)| is called with every run of code units
+  // that is advanced past.
+  template <typename FindFunction, typename SkippedFunction>
+  V8_INLINE base::uc32 AdvanceUntil(FindFunction find,
+                                    SkippedFunction skipped) {
+    while (true) {
+      const uint16_t* next_cursor_pos = find(buffer_cursor_, buffer_end_);
+      skipped(buffer_cursor_, next_cursor_pos);
 
       if (next_cursor_pos == buffer_end_) {
         buffer_cursor_ = buffer_end_;
@@ -425,6 +439,11 @@ class V8_EXPORT_PRIVATE Scanner {
     return ScanTemplateSpan();
   }
 
+  // sourceMappingURL values longer than this are not internalized. They are
+  // typically inline source maps (data: URLs), which are unique to a script
+  // and can be megabytes long, so the string table gains nothing from them.
+  static constexpr int kMaxInternalizedSourceMappingUrlLength = 1024;
+
   template <typename IsolateT>
   DirectHandle<String> SourceUrl(IsolateT* isolate) const;
   template <typename IsolateT>
@@ -561,6 +580,11 @@ class V8_EXPORT_PRIVATE Scanner {
   template <typename FunctionType>
   V8_INLINE void AdvanceUntil(FunctionType check) {
     c0_ = source_->AdvanceUntil(check);
+  }
+
+  template <typename FindFunction, typename SkippedFunction>
+  V8_INLINE void AdvanceUntil(FindFunction find, SkippedFunction skipped) {
+    c0_ = source_->AdvanceUntil(find, skipped);
   }
 
   bool CombineSurrogatePair() {
