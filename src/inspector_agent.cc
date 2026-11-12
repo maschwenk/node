@@ -90,8 +90,13 @@ static void StartIoThreadWakeup(int signo, siginfo_t* info, void* ucontext) {
   uv_sem_post(&start_io_thread_semaphore);
 }
 
+// Posted by the watchdog thread once it has its name (process.forkSelf() tells
+// the threads of the process apart by name).
+static uv_sem_t watchdog_thread_named;
+
 inline void* StartIoThreadMain(void* unused) {
   uv_thread_setname("SignalInspector");
+  uv_sem_post(&watchdog_thread_named);
   for (;;) {
     uv_sem_wait(&start_io_thread_semaphore);
     RequestIoThreadStartOnAgents();
@@ -103,6 +108,7 @@ static int StartWatchdogThread() {
   // it's not safe to call directly from the signal handler, it can
   // deadlock with the thread it interrupts.
   CHECK_EQ(0, uv_sem_init(&start_io_thread_semaphore, 0));
+  CHECK_EQ(0, uv_sem_init(&watchdog_thread_named, 0));
   pthread_attr_t attr;
   CHECK_EQ(0, pthread_attr_init(&attr));
 #if defined(PTHREAD_STACK_MIN) && !defined(__FreeBSD__)
@@ -134,8 +140,11 @@ static int StartWatchdogThread() {
             uv_os_getpid(), strerror(err));
     fflush(stderr);
     uv_sem_destroy(&start_io_thread_semaphore);
+    uv_sem_destroy(&watchdog_thread_named);
     return -err;
   }
+  uv_sem_wait(&watchdog_thread_named);
+  uv_sem_destroy(&watchdog_thread_named);
   RegisterSignalHandler(SIGUSR1, StartIoThreadWakeup);
   // Restore original mask
   CHECK_EQ(0, pthread_sigmask(SIG_SETMASK, &sigmask, nullptr));
