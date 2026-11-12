@@ -35,11 +35,15 @@ class TaskQueue {
     void NotifyOfOutstandingCompletion();
     void BlockingDrain();
     void Stop();
-    // Make BlockingPop() return nullptr to every consumer while paused,
-    // without dropping the queued tasks (unlike Stop()), so that consumer
-    // threads can exit and be joined before fork(2) and be started again
-    // afterwards.
+    // fork(2) support. While paused, a consumer that calls BlockingPop()
+    // parks there (it takes no task) instead of returning; queued tasks stay
+    // queued. WaitUntilParked() waits (bounded) for |count| consumers to be
+    // parked. Then either ReleaseParked() makes the parked consumers return
+    // nullptr so that their threads can exit and be joined, or Resume() lets
+    // them continue. Resume() also ends a release.
     void Pause();
+    bool WaitUntilParked(int count, uint64_t timeout_ms);
+    void ReleaseParked();
     void Resume();
     // All queued tasks, in the order Pop() would have returned them. Store the
     // result before iterating it: used directly as a range-for initializer,
@@ -87,6 +91,9 @@ class TaskQueue {
   int outstanding_tasks_;
   bool stopped_;
   bool paused_ = false;
+  bool release_parked_ = false;
+  int parked_ = 0;
+  ConditionVariable parked_changed_;
   uint64_t next_sequence_ = 0;
   PriorityQueue task_queue_;
 };
@@ -222,9 +229,6 @@ class WorkerThreadsTaskRunner {
   bool StopThreadsForFork(uint64_t timeout_ms);
   void RestartThreadsAfterFork();
 
-  // Called by a worker thread right before it exits.
-  void OnWorkerThreadExit(int id);
-
  private:
   void StartWorkerThreads();
 
@@ -250,12 +254,6 @@ class WorkerThreadsTaskRunner {
   // threads_.size() as V8 sees it; constant for the life of the runner, also
   // while the threads are stopped for a fork.
   int number_of_threads_ = 0;
-  // Worker threads still inside PlatformWorkerThread(), and which ones have
-  // left it (indexed by worker id), guarded by workers_mutex_.
-  Mutex workers_mutex_;
-  ConditionVariable workers_exited_;
-  int running_workers_ = 0;
-  std::vector<bool> worker_exited_;
 };
 
 class NodePlatform : public MultiIsolatePlatform {

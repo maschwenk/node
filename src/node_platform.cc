@@ -24,7 +24,6 @@ struct PlatformWorkerData {
   int* pending_platform_workers;
   int id;
   PlatformDebugLogLevel debug_log_level;
-  WorkerThreadsTaskRunner* runner;
 };
 
 const char* GetTaskPriorityName(TaskPriority priority) {
@@ -84,9 +83,8 @@ static void PlatformWorkerThread(void* data) {
       pending_worker_tasks->Lock().NotifyOfOutstandingCompletion();
     }
   }
-  // BlockingPop() returned nullptr: the queue was stopped (shutdown) or paused
-  // (fork). Either way this thread runs no further task.
-  worker_data->runner->OnWorkerThreadExit(id);
+  // BlockingPop() returned nullptr: the queue was stopped (shutdown) or its
+  // parked consumers released (fork). Either way this thread exits.
 }
 
 static int GetActualThreadPoolSize(int thread_pool_size) {
@@ -349,11 +347,6 @@ void WorkerThreadsTaskRunner::StartWorkerThreads() {
 
   Mutex::ScopedLock lock(platform_workers_mutex);
   int pending_platform_workers = 0;
-  {
-    Mutex::ScopedLock workers_lock(workers_mutex_);
-    worker_exited_.assign(thread_pool_size_, false);
-    running_workers_ = 0;
-  }
 
   for (int i = 0; i < thread_pool_size_; i++) {
     auto worker_data = std::make_unique<PlatformWorkerData>(
@@ -362,20 +355,12 @@ void WorkerThreadsTaskRunner::StartWorkerThreads() {
                            &platform_workers_ready,
                            &pending_platform_workers,
                            i,
-                           debug_log_level_,
-                           this});
+                           debug_log_level_});
     std::unique_ptr<uv_thread_t> t { new uv_thread_t() };
-    {
-      Mutex::ScopedLock workers_lock(workers_mutex_);
-      running_workers_++;
-    }
     pending_platform_workers++;
     if (uv_thread_create(t.get(), PlatformWorkerThread, worker_data.get()) !=
         0) {
       pending_platform_workers--;
-      Mutex::ScopedLock workers_lock(workers_mutex_);
-      running_workers_--;
-      worker_exited_[i] = true;
       break;
     }
     worker_data.release();
@@ -387,13 +372,6 @@ void WorkerThreadsTaskRunner::StartWorkerThreads() {
   while (pending_platform_workers > 0) {
     platform_workers_ready.Wait(lock);
   }
-}
-
-void WorkerThreadsTaskRunner::OnWorkerThreadExit(int id) {
-  Mutex::ScopedLock lock(workers_mutex_);
-  running_workers_--;
-  worker_exited_[id] = true;
-  workers_exited_.Broadcast(lock);
 }
 
 void WorkerThreadsTaskRunner::PostTask(v8::TaskPriority priority,
@@ -432,72 +410,40 @@ bool WorkerThreadsTaskRunner::StopThreadsForFork(uint64_t timeout_ms) {
   CHECK_EQ(0, uv_thread_join(threads_[0].get()));
   threads_[0].reset();
 
-  // Each worker finishes the task it is running and leaves its loop instead
-  // of taking the next one. A running V8 job keeps its worker until the job
-  // runs out of work, which happens because nothing adds work while the main
-  // thread waits here.
-  pending_worker_tasks_.Lock().Pause();
-  bool stopped;
-  {
-    Mutex::ScopedLock lock(workers_mutex_);
-    const uint64_t deadline = uv_hrtime() + timeout_ms * 1000000;
-    while (running_workers_ > 0) {
-      const uint64_t now = uv_hrtime();
-      if (now >= deadline) break;
-      workers_exited_.TimedWait(lock, deadline - now);
-    }
-    stopped = running_workers_ == 0;
+  int workers = 0;
+  for (size_t i = 1; i < threads_.size(); i++) {
+    if (threads_[i]) workers++;
   }
 
-  if (stopped) {
-    for (size_t i = 1; i < threads_.size(); i++) {
-      if (!threads_[i]) continue;
-      CHECK_EQ(0, uv_thread_join(threads_[i].get()));
-      threads_[i].reset();
+  // Each worker finishes the task it is running and parks instead of taking
+  // the next one. A running V8 job keeps its worker until the job runs out of
+  // work, which happens because nothing adds work while the main thread waits
+  // here.
+  bool parked;
+  {
+    auto locked = pending_worker_tasks_.Lock();
+    locked.Pause();
+    parked = locked.WaitUntilParked(workers, timeout_ms);
+    if (parked) {
+      locked.ReleaseParked();
+    } else {
+      // A worker is still busy, for instance blocked until the main thread
+      // performs a garbage collection it asked for. Let everyone continue.
+      locked.Resume();
     }
-    return true;
   }
 
-  // A worker is still busy, for instance blocked until the main thread
-  // performs a garbage collection it asked for. Undo: let the busy workers
-  // continue, replace the ones that already left, restart the scheduler.
-  pending_worker_tasks_.Lock().Resume();
-  std::vector<int> exited;
-  {
-    Mutex::ScopedLock lock(workers_mutex_);
-    for (int i = 0; i < thread_pool_size_; i++) {
-      if (worker_exited_[i] && threads_[i + 1]) exited.push_back(i);
-    }
+  if (!parked) {
+    threads_[0] = delayed_task_scheduler_->RestartAfterFork();
+    return false;
   }
-  for (int i : exited) {
-    CHECK_EQ(0, uv_thread_join(threads_[i + 1].get()));
-    threads_[i + 1].reset();
-    auto worker_data = std::make_unique<PlatformWorkerData>(
-        PlatformWorkerData{&pending_worker_tasks_,
-                           nullptr,
-                           nullptr,
-                           nullptr,
-                           i,
-                           debug_log_level_,
-                           this});
-    std::unique_ptr<uv_thread_t> t{new uv_thread_t()};
-    {
-      Mutex::ScopedLock lock(workers_mutex_);
-      running_workers_++;
-      worker_exited_[i] = false;
-    }
-    if (uv_thread_create(t.get(), PlatformWorkerThread, worker_data.get()) !=
-        0) {
-      Mutex::ScopedLock lock(workers_mutex_);
-      running_workers_--;
-      worker_exited_[i] = true;
-      continue;
-    }
-    worker_data.release();
-    threads_[i + 1] = std::move(t);
+
+  for (size_t i = 1; i < threads_.size(); i++) {
+    if (!threads_[i]) continue;
+    CHECK_EQ(0, uv_thread_join(threads_[i].get()));
+    threads_[i].reset();
   }
-  threads_[0] = delayed_task_scheduler_->RestartAfterFork();
-  return false;
+  return true;
 }
 
 void WorkerThreadsTaskRunner::RestartThreadsAfterFork() {
@@ -1006,14 +952,23 @@ std::unique_ptr<T> TaskQueue<T>::Locked::Pop() {
 
 template <class T>
 std::unique_ptr<T> TaskQueue<T>::Locked::BlockingPop() {
-  while (queue_->task_queue_.empty() && !queue_->stopped_ &&
-         !queue_->paused_) {
+  for (;;) {
+    if (queue_->stopped_) return std::unique_ptr<T>(nullptr);
+    if (queue_->paused_) {
+      if (queue_->release_parked_) return std::unique_ptr<T>(nullptr);
+      // Parked for a fork: take no task until resumed or released.
+      queue_->parked_++;
+      queue_->parked_changed_.Broadcast(lock_);
+      while (queue_->paused_ && !queue_->release_parked_ &&
+             !queue_->stopped_) {
+        queue_->tasks_available_.Wait(lock_);
+      }
+      queue_->parked_--;
+      continue;
+    }
+    if (!queue_->task_queue_.empty()) return queue_->PopTask();
     queue_->tasks_available_.Wait(lock_);
   }
-  if (queue_->stopped_ || queue_->paused_) {
-    return std::unique_ptr<T>(nullptr);
-  }
-  return queue_->PopTask();
 }
 
 template <class T>
@@ -1039,12 +994,32 @@ void TaskQueue<T>::Locked::Stop() {
 template <class T>
 void TaskQueue<T>::Locked::Pause() {
   queue_->paused_ = true;
+  queue_->release_parked_ = false;
+  queue_->tasks_available_.Broadcast(lock_);
+}
+
+template <class T>
+bool TaskQueue<T>::Locked::WaitUntilParked(int count, uint64_t timeout_ms) {
+  const uint64_t deadline = uv_hrtime() + timeout_ms * 1000000;
+  while (queue_->parked_ < count) {
+    const uint64_t now = uv_hrtime();
+    if (now >= deadline) return false;
+    queue_->parked_changed_.TimedWait(lock_, deadline - now);
+  }
+  return true;
+}
+
+template <class T>
+void TaskQueue<T>::Locked::ReleaseParked() {
+  queue_->release_parked_ = true;
   queue_->tasks_available_.Broadcast(lock_);
 }
 
 template <class T>
 void TaskQueue<T>::Locked::Resume() {
   queue_->paused_ = false;
+  queue_->release_parked_ = false;
+  queue_->tasks_available_.Broadcast(lock_);
 }
 
 template <class T>
