@@ -6,6 +6,7 @@
 #include "debug_utils-inl.h"
 #include "node_builtins.h"
 #include "node_external_reference.h"
+#include "node_heap_page_allocator.h"
 #include "node_internals.h"
 #include "node_options-inl.h"
 #include "node_realm.h"
@@ -49,6 +50,7 @@ NodeMainInstance::NodeMainInstance(const SnapshotData* snapshot_data,
   isolate_ =
       NewIsolate(isolate_params_.get(), event_loop, platform, snapshot_data);
   CHECK_NOT_NULL(isolate_);
+  MaybeRemapTextToHugePages(isolate_);
 
   // If the indexes are not nullptr, we are not deserializing
   isolate_data_.reset(

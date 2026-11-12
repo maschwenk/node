@@ -175,6 +175,19 @@ RegionAllocator::Address RegionAllocator::AllocateRegion(
   return region->begin();
 }
 
+RegionAllocator::Address RegionAllocator::AllocateRegionFromTop(size_t size) {
+  DCHECK_NE(size, 0);
+  DCHECK(IsAligned(size, page_size_));
+  for (auto it = all_regions_.rbegin(); it != all_regions_.rend(); ++it) {
+    Region* region = *it;
+    if (!region->is_free() || region->size() < size) continue;
+    Address address = region->end() - size;
+    if (!AllocateRegionAt(address, size)) return kAllocationFailure;
+    return address;
+  }
+  return kAllocationFailure;
+}
+
 RegionAllocator::Address RegionAllocator::AllocateRegion(
     RandomNumberGenerator* rng, size_t size) {
   if (free_size() >= max_load_for_randomization_) {

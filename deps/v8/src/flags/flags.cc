@@ -515,7 +515,8 @@ uint32_t ComputeFlagListHash() {
     if (flag.PointsTo(&v8_flags.max_old_space_size) ||
         flag.PointsTo(&v8_flags.min_semi_space_size) ||
         flag.PointsTo(&v8_flags.max_semi_space_size) ||
-        flag.PointsTo(&v8_flags.max_heap_size)) {
+        flag.PointsTo(&v8_flags.max_heap_size) ||
+        flag.PointsTo(&v8_flags.large_objects_at_cage_top)) {
       continue;
     }
 

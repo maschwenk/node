@@ -7,6 +7,7 @@
 
 #include "env-inl.h"
 #include "node.h"
+#include "node_heap_page_allocator.h"
 #include "node_options.h"
 #include "node_platform.h"
 #include "tracing/agent.h"
@@ -27,7 +28,9 @@ struct V8Platform {
     }
     // Tracing must be initialized before platform threads are created.
     platform_ = std::make_unique<NodePlatform>(
-        thread_pool_size, tracing_agent_->GetTracingController());
+        thread_pool_size,
+        tracing_agent_->GetTracingController(),
+        GetHeapPageAllocatorFromEnvironment());
     v8::V8::InitializePlatform(platform_.get());
   }
   // Make sure V8Platform don not call into Libuv threadpool,

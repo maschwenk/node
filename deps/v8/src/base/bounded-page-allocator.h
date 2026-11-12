@@ -116,6 +116,10 @@ class V8_BASE_EXPORT BoundedPageAllocator : public v8::PageAllocator {
   // Allocates pages at given address, returns true on success.
   bool AllocatePagesAt(Address address, size_t size, Permission access);
 
+  // Allocates pages at the highest address where they fit, keeping them
+  // apart from the allocations that fill the range from the bottom.
+  void* AllocatePagesFromTop(size_t size, Permission access);
+
   bool ResizeAllocationAt(void* address, size_t old_size, size_t new_size,
                           Permission access) override;
 
