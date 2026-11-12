@@ -327,7 +327,7 @@ void ForkSelf(const FunctionCallbackInfo<Value>& args) {
     return THROW_ERR_FORK_SELF_UNSAFE(
         env,
         "process.forkSelf() cannot fork while threads it does not know how to "
-        "handle are running (native addons?): %s",
+        "handle are running (a native addon's, a profiler's): %s",
         unknown_threads);
   }
 
@@ -340,6 +340,10 @@ void ForkSelf(const FunctionCallbackInfo<Value>& args) {
 #if HAVE_INSPECTOR
   inspector::PrepareForFork();
 #endif
+  // Watch SIGCHLD before the child exists: a child that exits before the
+  // watcher is installed would send its SIGCHLD to nobody and stay a zombie.
+  ForkedChildren* forked = GetForkedChildren(env);
+
   const uint64_t t_fork = uv_hrtime();
   const pid_t pid = fork();
   const int fork_errno = errno;
@@ -394,9 +398,8 @@ void ForkSelf(const FunctionCallbackInfo<Value>& args) {
     return env->ThrowErrnoException(fork_errno, "fork");
   }
   if (pid > 0) {
-    ForkedChildren* children = GetForkedChildren(env);
-    children->children.push_back({pid, args[1]->IsTrue()});
-    children->UpdateRef();
+    forked->children.push_back({pid, args[1]->IsTrue()});
+    forked->UpdateRef();
   }
   args.GetReturnValue().Set(static_cast<int32_t>(pid));
 }
