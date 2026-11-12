@@ -138,6 +138,19 @@
     # Enable using multiple threads to build builtins in mksnapshot.
     'v8_enable_concurrent_mksnapshot%': 1,
 
+    # Builtins PGO, see the comments on the same variables in deps/v8/BUILD.gn.
+    # Runs mksnapshot with --turbo-profiling: builtins count how often each of
+    # their basic blocks runs, and a run with --turbo-profiling-output=<file>
+    # writes the counts at exit.
+    'v8_enable_builtins_profiling%': 0,
+    # A profile (branch hints and block counts, from
+    # deps/v8/tools/builtins-pgo/get_hints.py) that mksnapshot uses to optimize
+    # the builtins it generates (--turbo-profiling-input).
+    'v8_builtins_profiling_log_file%': '',
+    # With a profile, also lay out the builtins in the embedded blob by their
+    # profiled call graph (--reorder-builtins).
+    'v8_enable_builtins_reordering%': 1,
+
     # Enable the registration of unwinding info for Windows/x64 and ARM64.
     'v8_win64_unwinding_info%': 1,
 

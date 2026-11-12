@@ -6375,6 +6375,13 @@ std::unique_ptr<PersistentHandles> Isolate::NewPersistentHandles() {
 }
 
 void Isolate::DumpAndResetStats() {
+  // Embedders that exit without tearing the isolate down (for example Node's
+  // process.exit()) call this on the way out. Write the builtins profile here
+  // as well, or it would be lost.
+  if (v8_flags.turbo_profiling_output &&
+      BasicBlockProfiler::Get()->HasData(this)) {
+    DumpAndResetBuiltinsProfileData();
+  }
   if (v8_flags.trace_turbo_stack_accesses) {
     StdoutStream os;
     uint64_t total_loads = 0;
@@ -6453,16 +6460,45 @@ void Isolate::DumpAndResetStats() {
 #endif  // V8_RUNTIME_CALL_STATS
 }
 
+namespace {
+
+// A "%p" in --turbo-profiling-output expands to the process id, so that every
+// process of a multi-process workload writes its own file. A process that
+// writes more than one file (one per isolate, or a dump at exit followed by
+// one at teardown) gets "-<n>" appended to the id for the later files.
+std::string BuiltinsProfileOutputPath(const char* pattern) {
+  static std::atomic<int> dumps_in_process{0};
+  std::string path(pattern);
+  size_t pos = path.find("%p");
+  if (pos == std::string::npos) return path;
+  std::string id = std::to_string(base::OS::GetCurrentProcessId());
+  int n = dumps_in_process.fetch_add(1, std::memory_order_relaxed);
+  if (n > 0) id += "-" + std::to_string(n);
+  path.replace(pos, 2, id);
+  return path;
+}
+
+}  // namespace
+
 void Isolate::DumpAndResetBuiltinsProfileData() {
   if (BasicBlockProfiler::Get()->HasData(this)) {
     if (v8_flags.turbo_profiling_output) {
-      FILE* f = std::fopen(v8_flags.turbo_profiling_output, "w");
-      if (f == nullptr) {
-        FATAL("Unable to open file \"%s\" for writing.\n",
-              v8_flags.turbo_profiling_output.value());
-      }
-      OFStream pgo_stream(f);
+      std::ostringstream pgo_stream;
       BasicBlockProfiler::Get()->Log(this, pgo_stream);
+      std::string data = pgo_stream.str();
+      // Counters that were already dumped and reset produce no output; don't
+      // create (or truncate) a file for them.
+      if (!data.empty()) {
+        std::string path =
+            BuiltinsProfileOutputPath(v8_flags.turbo_profiling_output);
+        FILE* f = std::fopen(path.c_str(), "w");
+        if (f == nullptr) {
+          FATAL("Unable to open file \"%s\" for writing.\n", path.c_str());
+        }
+        size_t written = std::fwrite(data.data(), 1, data.size(), f);
+        CHECK_EQ(written, data.size());
+        CHECK_EQ(std::fclose(f), 0);
+      }
     } else {
       StdoutStream out;
       BasicBlockProfiler::Get()->Print(this, out);
