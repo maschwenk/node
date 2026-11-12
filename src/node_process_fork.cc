@@ -29,6 +29,9 @@
 #include "uv.h"
 #include "v8-fork.h"
 #include "v8.h"
+#if HAVE_OPENSSL
+#include "crypto/crypto_util.h"
+#endif
 
 #if defined(__POSIX__) && !defined(__PASE__)
 #include <sys/types.h>
@@ -36,6 +39,8 @@
 #include <unistd.h>
 #include <cerrno>
 #include <cstdio>
+#include <cstdlib>
+#include <string>
 #include <vector>
 #endif
 
@@ -179,6 +184,42 @@ ForkedChildren* GetForkedChildren(Environment* env) {
   return children;
 }
 
+// The threads of this process other than the calling one that fork(2) cannot
+// leave behind safely, by name. Known to be fine: the SIGUSR1 watchdog
+// (recreated in the child) and idle libuv threadpool workers (libuv's atfork
+// handler recreates the pool; no request is in flight, checked above).
+// Linux only; elsewhere the list is empty.
+std::string UnknownThreads() {
+  std::string unknown;
+#ifdef __linux__
+  const pid_t self = getpid();
+  uv_fs_t req;
+  if (uv_fs_scandir(nullptr, &req, "/proc/self/task", 0, nullptr) < 0) {
+    uv_fs_req_cleanup(&req);
+    return unknown;
+  }
+  uv_dirent_t ent;
+  while (uv_fs_scandir_next(&req, &ent) == 0) {
+    const pid_t tid = static_cast<pid_t>(strtol(ent.name, nullptr, 10));
+    if (tid == self) continue;
+    std::string path = std::string("/proc/self/task/") + ent.name + "/comm";
+    char name[64] = {0};
+    FILE* f = fopen(path.c_str(), "re");
+    if (f == nullptr) continue;  // Exited meanwhile.
+    if (fgets(name, sizeof(name), f) == nullptr) name[0] = '\0';
+    fclose(f);
+    std::string comm(name);
+    while (!comm.empty() && (comm.back() == '\n' || comm.back() == ' '))
+      comm.pop_back();
+    if (comm == "SignalInspector" || comm == "libuv-worker") continue;
+    if (!unknown.empty()) unknown += ", ";
+    unknown += comm + " (" + ent.name + ")";
+  }
+  uv_fs_req_cleanup(&req);
+#endif
+  return unknown;
+}
+
 }  // namespace
 
 // setForkSelfExitCallback(fn): fn(pid, exitCode, signal) runs when a child
@@ -256,8 +297,32 @@ void ForkSelf(const FunctionCallbackInfo<Value>& args) {
   // Nothing buffered by C stdio may be written by both processes.
   fflush(nullptr);
 
+#if HAVE_OPENSSL
+  // One-shot threads that parse the CA certificates after the first TLS use.
+  crypto::JoinCertificateLoadingThreads();
+#endif
+
   if (!platform->StopThreadsForFork(stop_timeout_ms)) {
     return args.GetReturnValue().Set(kForkSelfBusy);
+  }
+
+  // Every thread that is still running now must be one that survives fork(2)
+  // as is. Anything else (a native addon's thread, a Node.js thread this
+  // code does not know about) would be missing in the child while its state
+  // says it runs, possibly holding a lock.
+  std::string unknown_threads = UnknownThreads();
+  // A thread that was just joined can still be listed for a moment.
+  for (int i = 0; i < 20 && !unknown_threads.empty(); i++) {
+    uv_sleep(1);
+    unknown_threads = UnknownThreads();
+  }
+  if (!unknown_threads.empty()) {
+    platform->RestartThreadsAfterFork();
+    return THROW_ERR_FORK_SELF_UNSAFE(
+        env,
+        "process.forkSelf() cannot fork while threads it does not know how to "
+        "handle are running (native addons?): %s",
+        unknown_threads);
   }
 
   // libuv clears the pending flag of every async handle in the child (another
