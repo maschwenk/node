@@ -359,6 +359,12 @@ void ForkSelf(const FunctionCallbackInfo<Value>& args) {
               uv_strerror(err));
       ABORT();
     }
+    // The tracing agent has a loop of its own (its thread does not run, see
+    // above), which runs once more at exit. Without this, the parent and
+    // every child would submit to the same io_uring ring then, and the ring's
+    // shared head and tail trip libuv's checks (abort() in a random process).
+    if (per_process::v8_platform.tracing_agent_)
+      per_process::v8_platform.tracing_agent_->ReinitializeLoopAfterFork();
     for (uv_async_t* async : pending_async_handles) uv_async_send(async);
     // The parent's other children are not this process's to reap.
     if (forked_children != nullptr) {
