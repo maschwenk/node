@@ -35,6 +35,12 @@ class TaskQueue {
     void NotifyOfOutstandingCompletion();
     void BlockingDrain();
     void Stop();
+    // Make BlockingPop() return nullptr to every consumer while paused,
+    // without dropping the queued tasks (unlike Stop()), so that consumer
+    // threads can exit and be joined before fork(2) and be started again
+    // afterwards.
+    void Pause();
+    void Resume();
     // All queued tasks, in the order Pop() would have returned them. Store the
     // result before iterating it: used directly as a range-for initializer,
     // `Lock().PopAll()` keeps the lock held for the whole loop from C++23 on.
@@ -80,6 +86,7 @@ class TaskQueue {
   ConditionVariable outstanding_tasks_drained_;
   int outstanding_tasks_;
   bool stopped_;
+  bool paused_ = false;
   uint64_t next_sequence_ = 0;
   PriorityQueue task_queue_;
 };
@@ -206,7 +213,21 @@ class WorkerThreadsTaskRunner {
 
   int NumberOfWorkerThreads() const;
 
+  // fork(2) support. StopThreadsForFork() stops every thread of the runner at
+  // a point where none of them is running a task; queued tasks and delayed
+  // tasks are kept. It returns false, with every thread running again, if the
+  // worker threads did not finish their current tasks within |timeout_ms|.
+  // RestartThreadsAfterFork() starts them again, in the parent and in the
+  // child. Main thread only.
+  bool StopThreadsForFork(uint64_t timeout_ms);
+  void RestartThreadsAfterFork();
+
+  // Called by a worker thread right before it exits.
+  void OnWorkerThreadExit(int id);
+
  private:
+  void StartWorkerThreads();
+
   // A queue shared by all threads. The consumers are the worker threads which
   // take tasks from it to run in PlatformWorkerThread(). The producers can be
   // any thread. Both the foreground thread and the worker threads can push
@@ -222,6 +243,19 @@ class WorkerThreadsTaskRunner {
 
   std::vector<std::unique_ptr<uv_thread_t>> threads_;
   PlatformDebugLogLevel debug_log_level_ = PlatformDebugLogLevel::kNone;
+
+  // Number of platform worker threads requested (threads_ also holds the
+  // delayed task scheduler thread).
+  int thread_pool_size_ = 0;
+  // threads_.size() as V8 sees it; constant for the life of the runner, also
+  // while the threads are stopped for a fork.
+  int number_of_threads_ = 0;
+  // Worker threads still inside PlatformWorkerThread(), and which ones have
+  // left it (indexed by worker id), guarded by workers_mutex_.
+  Mutex workers_mutex_;
+  ConditionVariable workers_exited_;
+  int running_workers_ = 0;
+  std::vector<bool> worker_exited_;
 };
 
 class NodePlatform : public MultiIsolatePlatform {
@@ -268,6 +302,10 @@ class NodePlatform : public MultiIsolatePlatform {
 
   Platform::StackTracePrinter GetStackTracePrinter() override;
   v8::PageAllocator* GetPageAllocator() override;
+
+  // fork(2) support, see WorkerThreadsTaskRunner. Main thread only.
+  bool StopThreadsForFork(uint64_t timeout_ms);
+  void RestartThreadsAfterFork();
 
  private:
   IsolatePlatformDelegate* ForIsolate(v8::Isolate* isolate);
