@@ -289,10 +289,14 @@ void ForkSelf(const FunctionCallbackInfo<Value>& args) {
     if (value >= 0) stop_timeout_ms = static_cast<uint64_t>(value);
   }
 
+  static const bool print_timing = getenv("NODE_FORK_SELF_TIMING") != nullptr;
+  const uint64_t t_start = uv_hrtime();
+
   // On Linux V8 marks its mappings MADV_DONTFORK (so that child_process
   // spawns do not copy the heap's page tables): the child needs them. Once per
   // process, a few milliseconds the first time.
   v8::MakeMappingsForkable();
+  const uint64_t t_forkable = uv_hrtime();
 
   // Nothing buffered by C stdio may be written by both processes.
   fflush(nullptr);
@@ -302,9 +306,11 @@ void ForkSelf(const FunctionCallbackInfo<Value>& args) {
   crypto::JoinCertificateLoadingThreads();
 #endif
 
+  const uint64_t t_certs = uv_hrtime();
   if (!platform->StopThreadsForFork(stop_timeout_ms)) {
     return args.GetReturnValue().Set(kForkSelfBusy);
   }
+  const uint64_t t_stopped = uv_hrtime();
 
   // Every thread that is still running now must be one that survives fork(2)
   // as is. Anything else (a native addon's thread, a Node.js thread this
@@ -334,8 +340,10 @@ void ForkSelf(const FunctionCallbackInfo<Value>& args) {
 #if HAVE_INSPECTOR
   inspector::PrepareForFork();
 #endif
+  const uint64_t t_fork = uv_hrtime();
   const pid_t pid = fork();
   const int fork_errno = errno;
+  const uint64_t t_forked = uv_hrtime();
 
   if (pid == 0) {
     // In the child, before anything can use the loop or wake it up from
@@ -355,6 +363,7 @@ void ForkSelf(const FunctionCallbackInfo<Value>& args) {
     }
     DisownStdioAfterFork();
     v8::ReseedRandomNumberGeneratorsAfterFork(env->isolate());
+    v8::ReopenPerfMapAfterFork();
     // process.pid was computed once at startup. It is a configurable,
     // read-only data property (see PatchProcessObject()).
     Isolate* isolate = env->isolate();
@@ -369,6 +378,17 @@ void ForkSelf(const FunctionCallbackInfo<Value>& args) {
   inspector::AfterFork(pid == 0);
 #endif
   platform->RestartThreadsAfterFork();
+
+  if (print_timing && pid != 0) {
+    const uint64_t t_end = uv_hrtime();
+    auto ms = [](uint64_t a, uint64_t b) { return (b - a) / 1e6; };
+    fprintf(stderr,
+            "forkSelf timing (ms): forkable %.3f certs %.3f stop %.3f "
+            "census %.3f fork %.3f restart %.3f total %.3f\n",
+            ms(t_start, t_forkable), ms(t_forkable, t_certs),
+            ms(t_certs, t_stopped), ms(t_stopped, t_fork),
+            ms(t_fork, t_forked), ms(t_forked, t_end), ms(t_start, t_end));
+  }
 
   if (pid < 0) {
     return env->ThrowErrnoException(fork_errno, "fork");

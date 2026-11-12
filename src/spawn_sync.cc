@@ -27,6 +27,7 @@
 #include "node_internals.h"
 #include "string_bytes.h"
 #include "util-inl.h"
+#include "v8-fork.h"
 
 #include <cstring>
 #include "nbytes.h"
@@ -514,6 +515,9 @@ Maybe<void> SyncProcessRunner::TryInitializeAndRunLoop(Local<Value> options) {
   }
 
   uv_process_options_.exit_cb = ExitCallback;
+  // A fork that is followed by exec: let it skip the heap again if
+  // process.forkSelf() made the heap copyable.
+  v8::MakeMappingsUnforkable();
   r = uv_spawn(uv_loop_, &uv_process_, &uv_process_options_);
   if (r < 0) {
     SetError(r);
