@@ -167,6 +167,14 @@
     # Sets -dV8_SHORT_BUILTIN_CALLS
     'v8_enable_short_builtin_calls%': 0,
 
+    # Runs mksnapshot with --turbo-profiling (basic block counters in the
+    # embedded builtins, written by --turbo-profiling-output=<file>).
+    'v8_enable_builtins_profiling%': 0,
+
+    # Branch hints for the embedded builtins (builtins PGO), passed to
+    # mksnapshot with --turbo-profiling-input.
+    'v8_builtins_profiling_log_file%': '',
+
     # Sets -dOBJECT_PRINT.
     'v8_enable_object_print%': 0,
 
