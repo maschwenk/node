@@ -666,12 +666,22 @@ static void PlatformInit(ProcessInitializationFlags::Flags flags) {
 #endif  // _WIN32
 }
 
+// Set in a process created by process.forkSelf(): the stdio state recorded by
+// PlatformInit() belongs to the parent, which still uses the same open file
+// descriptions (O_NONBLOCK is shared between processes) and terminal.
+static std::atomic<bool> stdio_owned_by_parent = false;
+
+void DisownStdioAfterFork() {
+  stdio_owned_by_parent.store(true);
+}
+
 // Safe to call more than once and from signal handlers.
 void ResetStdio() {
   if (init_process_flags.load() &
       ProcessInitializationFlags::kNoStdioInitialization) {
     return;
   }
+  if (stdio_owned_by_parent.load()) return;
 
   uv_tty_reset_mode();
 #ifdef __POSIX__

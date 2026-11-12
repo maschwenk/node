@@ -774,6 +774,11 @@ bool SigintWatchdogHelper::InformWatchdogsAboutSignal() {
 }
 
 
+bool SigintWatchdogHelper::IsRunning() {
+  Mutex::ScopedLock lock(mutex_);
+  return start_stop_count_ > 0;
+}
+
 int SigintWatchdogHelper::Start() {
   Mutex::ScopedLock lock(mutex_);
 

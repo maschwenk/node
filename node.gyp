@@ -153,6 +153,7 @@
       'src/node_profiling.cc',
       'src/node_postmortem_metadata.cc',
       'src/node_process_events.cc',
+      'src/node_process_fork.cc',
       'src/node_process_methods.cc',
       'src/node_process_object.cc',
       'src/node_realm.cc',

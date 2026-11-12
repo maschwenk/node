@@ -102,6 +102,7 @@ class PerfettoTracingAgent final : public Agent {
                               std::unique_ptr<TraceWriter> writer,
                               enum UseDefaultCategoryMode mode);
   std::string GetEnabledCategories() const override;
+  bool IsThreadRunning() const override { return started_; }
 
   void StartTracing(const std::string& categories) override;
   void StopTracing() override;
