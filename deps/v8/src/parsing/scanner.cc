@@ -14,6 +14,8 @@
 #include "src/ast/ast-value-factory.h"
 #include "src/base/strings.h"
 #include "src/base/vlq-base64.h"
+#include "src/execution/isolate.h"
+#include "src/heap/factory.h"
 #include "src/numbers/conversions-inl.h"
 #include "src/numbers/conversions.h"
 #include "src/objects/bigint.h"
@@ -347,23 +349,37 @@ void Scanner::TryToParseMagicComment(base::uc32 hash_or_at_sign) {
   while (IsWhiteSpace(c0_)) {
     Advance();
   }
+  int value_beg_pos = source_pos();
   // The value ends at whitespace or a line terminator. Copy it a buffer at a
-  // time rather than a character at a time, since it can be long.
+  // time rather than a character at a time, since it can be long. Long
+  // sourceMappingURL values are only copied if they can't be sliced out of
+  // the source later.
   if (c0_ != kEndOfInput && !IsWhiteSpaceOrLineTerminator(c0_)) {
+    int max_copied_length =
+        value == &source_mapping_url_ && slice_long_source_mapping_url_
+            ? kMaxInternalizedSourceMappingUrlLength
+            : kMaxInt;
     value->AddChar(c0_);
     AdvanceUntil(FindEndOfMagicCommentValue,
-                 [value](const uint16_t* begin, const uint16_t* end) {
+                 [value, max_copied_length](const uint16_t* begin,
+                                            const uint16_t* end) {
+                   if (value->length() > max_copied_length) return;
                    value->AddChars(base::Vector<const uint16_t>(
                        begin, static_cast<size_t>(end - begin)));
                  });
   }
+  int value_end_pos = source_pos();
   // Allow whitespace at the end.
   while (c0_ != kEndOfInput && !unibrow::IsLineTerminator(c0_)) {
     if (!IsWhiteSpace(c0_)) {
       value->Start();
+      value_end_pos = value_beg_pos;
       break;
     }
     Advance();
+  }
+  if (value == &source_mapping_url_) {
+    source_mapping_url_location_ = Location(value_beg_pos, value_end_pos);
   }
   if (value == &per_function_compile_hints_value &&
       per_function_compile_hints_value.is_one_byte()) {
@@ -730,6 +746,11 @@ template DirectHandle<String> Scanner::SourceUrl(LocalIsolate* isolate) const;
 
 template <typename IsolateT>
 DirectHandle<String> Scanner::SourceMappingUrl(IsolateT* isolate) const {
+  DCHECK_IMPLIES(slice_long_source_mapping_url_,
+                 source_mapping_url_location_.length() <=
+                     kMaxInternalizedSourceMappingUrlLength);
+  DCHECK_EQ(source_mapping_url_.length(),
+            source_mapping_url_location_.length());
   DirectHandle<String> tmp;
   if (source_mapping_url_.length() > kMaxInternalizedSourceMappingUrlLength) {
     tmp = source_mapping_url_.NewString(isolate);
@@ -742,6 +763,28 @@ DirectHandle<String> Scanner::SourceMappingUrl(IsolateT* isolate) const {
 template DirectHandle<String> Scanner::SourceMappingUrl(Isolate* isolate) const;
 template DirectHandle<String> Scanner::SourceMappingUrl(
     LocalIsolate* isolate) const;
+
+DirectHandle<String> Scanner::SourceMappingUrl(
+    Isolate* isolate, DirectHandle<String> source) const {
+  if (!slice_long_source_mapping_url_ ||
+      source_mapping_url_location_.length() <=
+          kMaxInternalizedSourceMappingUrlLength) {
+    return SourceMappingUrl(isolate);
+  }
+  int beg_pos = source_mapping_url_location_.beg_pos;
+  int length = source_mapping_url_location_.length();
+  CHECK_LE(source_mapping_url_location_.end_pos, source->length());
+  source = String::Flatten(isolate, source);
+  // The script keeps its source alive, so a slice of it costs no memory where
+  // a copy of an inline source map costs megabytes. Only slice when the value
+  // is at least half of the source, so that a slice that outlives the script
+  // keeps at most twice its own size alive.
+  if (length >= source->length() / 2) {
+    return isolate->factory()->NewProperSubString(source, beg_pos,
+                                                  beg_pos + length);
+  }
+  return isolate->factory()->NewCopiedSubstring(source, beg_pos, length);
+}
 
 template <typename IsolateT>
 DirectHandle<String> Scanner::DebugId(IsolateT* isolate) const {

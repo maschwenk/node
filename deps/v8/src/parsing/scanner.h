@@ -451,6 +451,17 @@ class V8_EXPORT_PRIVATE Scanner {
   template <typename IsolateT>
   DirectHandle<String> DebugId(IsolateT* isolate) const;
 
+  // Long sourceMappingURL values are not copied while scanning; this takes
+  // them from |source|, which must be the string the scanner reads, usually
+  // as a slice. To be called after set_slice_long_source_mapping_url().
+  DirectHandle<String> SourceMappingUrl(Isolate* isolate,
+                                        DirectHandle<String> source) const;
+  // Called before scanning when the source will be available as a string to
+  // SourceMappingUrl(isolate, source), i.e. on the main thread.
+  void set_slice_long_source_mapping_url() {
+    slice_long_source_mapping_url_ = true;
+  }
+
   bool SawSourceMappingUrlMagicCommentAtSign() const {
     return saw_source_mapping_url_magic_comment_at_sign_;
   }
@@ -790,7 +801,10 @@ class V8_EXPORT_PRIVATE Scanner {
   // Values parsed from magic comments.
   LiteralBuffer source_url_;
   LiteralBuffer source_mapping_url_;
+  // Where the value in source_mapping_url_ is in the source.
+  Location source_mapping_url_location_;
   LiteralBuffer debug_id_;
+  bool slice_long_source_mapping_url_ = false;
   bool saw_source_mapping_url_magic_comment_at_sign_ = false;
   bool saw_magic_comment_compile_hints_all_ = false;
   bool saw_non_comment_ = false;

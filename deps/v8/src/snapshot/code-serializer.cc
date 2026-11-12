@@ -82,12 +82,26 @@ ScriptCompiler::CachedData* CodeSerializer::Serialize(
   CodeSerializer cs(isolate,
                     SerializedCodeData::SourceHash(source, wrapped_arguments,
                                                    script->origin_options()));
+
+  // The parser makes long source map URLs slices of the source, but the
+  // source is not part of the cache: the deserializer attaches whatever
+  // string the embedder passes, or a placeholder when deserializing off the
+  // main thread. Serialize a copy of the URL instead.
+  DirectHandle<Object> source_mapping_url(script->source_mapping_url(),
+                                          isolate);
+  if (IsSlicedString(*source_mapping_url)) {
+    DirectHandle<String> url = Cast<String>(source_mapping_url);
+    script->set_source_mapping_url(
+        *isolate->factory()->NewCopiedSubstring(url, 0, url->length()));
+  }
+
   DisallowGarbageCollection no_gc;
 
 #ifndef DEBUG
   cs.reference_map()->AddAttachedReference(*source);
 #endif
   AlignedCachedData* cached_data = cs.SerializeSharedFunctionInfo(info);
+  script->set_source_mapping_url(*source_mapping_url);
 
   if (v8_flags.profile_deserialization) {
     double ms = timer.Elapsed().InMillisecondsF();
