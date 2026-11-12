@@ -4,7 +4,7 @@
 // functions first called after a module was loaded are compiled from the
 // cache by the next run instead of lazily.
 
-require('../common');
+const common = require('../common');
 const { spawnSyncAndAssert } = require('../common/child_process');
 const assert = require('assert');
 const { spawnSync } = require('child_process');
@@ -71,38 +71,41 @@ function run(dir, script, args, stderr, { flags = v8Flags, env = {} } = {}) {
 {
   // CommonJS: the cache holds the functions that ran, grows when a later
   // run calls more of them, and does not shrink when a run calls fewer.
+  // NODE_COMPILE_CACHE_REFRESH=1 refreshes every accepted entry, so that
+  // growth does not depend on which entries a process samples.
   const dir = tmpdir.resolve('cjs');
-  let lazy = run(dir, cjs, ['late'], (output) => {
+  const env = { NODE_COMPILE_CACHE_REFRESH: '1' };
+  let lazy = run(dir, cjs, ['late'], common.mustCall((output) => {
     assert.match(output, /after-execution\.js was not initialized, initializing the in-memory entry after execution/);
     assert.match(output, /writing cache for CommonJS .*after-execution\.js.*success/);
-  });
+  }), { env });
   assert(lazy.has('atLoad'));
   assert(lazy.has('late'));
   const size1 = cacheSize(dir);
 
-  lazy = run(dir, cjs, ['late'], (output) => {
+  lazy = run(dir, cjs, ['late'], common.mustCall((output) => {
     assert.match(output, /after-execution\.js was accepted, keeping the in-memory entry/);
     assert.match(output, /skip persisting CommonJS .*after-execution\.js because cache was the same/);
-  });
+  }), { env });
   assert(!lazy.has('atLoad'));
   assert(!lazy.has('late'));
   assert.strictEqual(cacheSize(dir), size1);
 
-  lazy = run(dir, cjs, ['late', 'later'], (output) => {
+  lazy = run(dir, cjs, ['late', 'later'], common.mustCall((output) => {
     assert.match(output, /writing cache for CommonJS .*after-execution\.js.*success/);
-  });
+  }), { env });
   assert(!lazy.has('late'));
   assert(lazy.has('later'));
   const size2 = cacheSize(dir);
   assert(size2 > size1, `${size2} > ${size1}`);
 
-  lazy = run(dir, cjs, [], (output) => {
+  lazy = run(dir, cjs, [], common.mustCall((output) => {
     assert.match(output, /skip persisting CommonJS .*after-execution\.js because cache was the same/);
-  });
+  }), { env });
   assert(!lazy.has('atLoad'));
   assert.strictEqual(cacheSize(dir), size2);
 
-  lazy = run(dir, cjs, ['late', 'later']);
+  lazy = run(dir, cjs, ['late', 'later'], null, { env });
   assert(!lazy.has('late'));
   assert(!lazy.has('later'));
 }
@@ -113,23 +116,39 @@ function run(dir, script, args, stderr, { flags = v8Flags, env = {} } = {}) {
   const dir = tmpdir.resolve('compile');
   const env = { NODE_COMPILE_CACHE_CAPTURE: 'compile' };
   run(dir, cjs, ['late'], null, { env });
-  const lazy = run(dir, cjs, ['late'], (output) => {
+  const lazy = run(dir, cjs, ['late'], common.mustCall((output) => {
     assert.match(output, /after-execution\.js was accepted, keeping the in-memory entry/);
-  }, { env });
+  }), { env });
   assert(lazy.has('atLoad'));
   assert(lazy.has('late'));
 }
 
 {
+  // NODE_COMPILE_CACHE_REFRESH=0 does not produce a new cache for an entry
+  // whose cache was accepted, so it does not grow.
+  const dir = tmpdir.resolve('no-refresh');
+  const env = { NODE_COMPILE_CACHE_REFRESH: '0' };
+  run(dir, cjs, ['late'], null, { env });
+  const size = cacheSize(dir);
+  const lazy = run(dir, cjs, ['late', 'later'], common.mustCall((output) => {
+    assert.match(output, /after-execution\.js was accepted, keeping the in-memory entry\n/);
+    assert.doesNotMatch(output, /writing cache for/);
+  }), { env });
+  assert(!lazy.has('late'));
+  assert(lazy.has('later'));
+  assert.strictEqual(cacheSize(dir), size);
+}
+
+{
   // ES modules.
   const dir = tmpdir.resolve('esm');
-  let lazy = run(dir, esm, ['late'], (output) => {
+  let lazy = run(dir, esm, ['late'], common.mustCall((output) => {
     assert.match(output, /writing cache for ESM .*after-execution\.mjs.*success/);
-  });
+  }));
   assert(lazy.has('late'));
-  lazy = run(dir, esm, ['late'], (output) => {
+  lazy = run(dir, esm, ['late'], common.mustCall((output) => {
     assert.match(output, /after-execution\.mjs was accepted, keeping the in-memory entry/);
-  });
+  }));
   assert(!lazy.has('atLoad'));
   assert(!lazy.has('late'));
 }

@@ -3548,12 +3548,14 @@ produced and written to disk while the process is still running (default: 2).
 When set to 1, the [module compile cache][]  can be reused across different directory
 locations as long as the module layout relative to the cache directory remains the same.
 
-### `NODE_COMPILE_CACHE_REFRESH=0`
+### `NODE_COMPILE_CACHE_REFRESH=n`
 
-When set to 0, the [module compile cache][] does not produce a new code cache
-for a module whose cache was read from disk and accepted, so caches no longer
-grow with the code that later runs exercise. This avoids the cost of producing
-the cache on every run once caches are known to be complete.
+For a module whose cache was read from disk and accepted, the
+[module compile cache][] produces a new code cache after execution, so that
+the cache grows when a run exercises code that earlier runs did not. This costs
+about as much as reading the cache. When set to `n`, each process does this for
+a different one in `n` of those modules; `1` does it for every module, and `0`
+turns it off, so caches no longer grow once written. Default: `8`.
 
 ### `NODE_DEBUG=module[,…]`
 

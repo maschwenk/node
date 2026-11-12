@@ -169,10 +169,15 @@ class CompileCacheHandler {
       compiler_cache_store_;
 
   CaptureMode capture_mode_ = CaptureMode::kExecution;
-  // Re-produce the cache of entries whose cache from disk was accepted, so a
-  // cache made by a run that exercised less code can grow. Turned off with
-  // NODE_COMPILE_CACHE_REFRESH=0.
-  bool refresh_accepted_ = true;
+  // Re-produce the cache of one in refresh_interval_ of the entries whose
+  // cache from disk was accepted, so a cache made by a run that exercised
+  // less code can grow. Serializing a cache costs about as much as consuming
+  // it, so refreshing every entry in every process adds up; each process
+  // picks a different subset (refresh_seed_), so with many processes or runs
+  // every entry still gets refreshed. 1 refreshes all, 0 none. Set with
+  // NODE_COMPILE_CACHE_REFRESH=n.
+  uint32_t refresh_interval_ = 8;
+  uint32_t refresh_seed_ = 0;
   // Major GCs after compilation at which an entry is checkpointed; 0 turns
   // checkpoints off. Set with NODE_COMPILE_CACHE_CHECKPOINT_GCS.
   uint32_t checkpoint_gcs_ = 2;

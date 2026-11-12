@@ -365,7 +365,8 @@ void CompileCacheHandler::MaybeSaveImpl(CompileCacheEntry* entry,
     // needed, to decide whether a later cache is worth writing.
     entry->best_size = entry->cache->length;
     entry->cache.reset();
-    if (!refresh_accepted_) {
+    if (refresh_interval_ == 0 ||
+        (entry->cache_key ^ refresh_seed_) % refresh_interval_ != 0) {
       Debug("keeping the in-memory entry\n");
       return;
     }
@@ -745,9 +746,11 @@ CompileCacheHandler::CompileCacheHandler(Environment* env)
     capture_mode_ = CaptureMode::kCompile;
   }
   if (credentials::SafeGetenv("NODE_COMPILE_CACHE_REFRESH", &value, env) &&
-      value == "0") {
-    refresh_accepted_ = false;
+      !value.empty()) {
+    refresh_interval_ =
+        static_cast<uint32_t>(strtoul(value.c_str(), nullptr, 10));
   }
+  refresh_seed_ = static_cast<uint32_t>(uv_hrtime() ^ uv_os_getpid());
   if (credentials::SafeGetenv(
           "NODE_COMPILE_CACHE_CHECKPOINT_GCS", &value, env) &&
       !value.empty()) {

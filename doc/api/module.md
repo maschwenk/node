@@ -433,8 +433,10 @@ that it also contains the functions that were called:
   [`module.flushCompileCache()`][] is called.
 
 A cache on disk is only replaced by a larger one, so a cache produced by a run
-that exercised less code grows when a later run exercises more, and is not
-rewritten when nothing changed. A process that is killed by a signal does not
+that exercised less code grows when later runs exercise more, and is not
+rewritten when nothing changed. To keep the cost of producing caches that did
+not change low, each process re-produces the cache of only some of the modules
+whose cache it read (see [`NODE_COMPILE_CACHE_REFRESH=n`][]). A process that is killed by a signal does not
 run its exit handlers; the cache it wrote at the earlier point is kept.
 
 The [`module.flushCompileCache()`][] method can be used to write the cache at a
@@ -2088,6 +2090,7 @@ returned object contains the following keys:
 [`--require`]: cli.md#-r---require-module
 [`NODE_COMPILE_CACHE=dir`]: cli.md#node_compile_cachedir
 [`NODE_COMPILE_CACHE_CAPTURE=compile`]: cli.md#node_compile_cache_capturecompile
+[`NODE_COMPILE_CACHE_REFRESH=n`]: cli.md#node_compile_cache_refreshn
 [`NODE_COMPILE_CACHE_PORTABLE=1`]: cli.md#node_compile_cache_portable1
 [`NODE_DISABLE_COMPILE_CACHE=1`]: cli.md#node_disable_compile_cache1
 [`NODE_V8_COVERAGE=dir`]: cli.md#node_v8_coveragedir
