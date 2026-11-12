@@ -22,6 +22,7 @@
 #include "include/v8-extension.h"
 #include "include/v8-external-memory-accounter.h"
 #include "include/v8-fast-api-calls.h"
+#include "include/v8-fork.h"
 #include "include/v8-function.h"
 #include "include/v8-json.h"
 #include "include/v8-locker.h"
@@ -89,6 +90,7 @@
 #include "src/objects/api-callbacks.h"
 #include "src/objects/backing-store.h"
 #include "src/objects/contexts.h"
+#include "src/numbers/math-random.h"
 #include "src/objects/cpp-heap-object-wrapper-inl.h"
 #include "src/objects/embedder-data-array-inl.h"
 #include "src/objects/embedder-data-slot-inl.h"
@@ -10723,6 +10725,38 @@ void Isolate::SetIsInputHandling(bool is_input_handling) {
 void Isolate::Freeze(bool is_frozen) {
   i::Isolate* i_isolate = reinterpret_cast<i::Isolate*>(this);
   i_isolate->Freeze(is_frozen);
+}
+
+#if V8_OS_POSIX
+namespace base {
+// Defined in src/base/platform/platform-posix.cc.
+void MakeMappingsForkable();
+}  // namespace base
+#endif
+
+void MakeMappingsForkable() {
+#if V8_OS_POSIX
+  base::MakeMappingsForkable();
+#endif
+}
+
+void ReseedRandomNumberGeneratorsAfterFork(Isolate* isolate) {
+  i::Isolate* i_isolate = reinterpret_cast<i::Isolate*>(isolate);
+  // With a fixed seed the embedder asked for reproducible sequences.
+  if (i::v8_flags.random_seed != 0) return;
+  // A default-constructed generator draws its seed from the embedder's
+  // entropy source (or the OS), not from state copied from the parent.
+  base::RandomNumberGenerator fresh;
+  i_isolate->random_number_generator()->SetSeed(fresh.NextInt64());
+  // Math.random() reseeds a context from the generator above when it finds a
+  // zero state, see MathRandom::RefillCache().
+  i::DisallowGarbageCollection no_gc;
+  i::Tagged<i::Object> context = i_isolate->heap()->native_contexts_list();
+  while (!i::IsUndefined(context, i_isolate)) {
+    i::Tagged<i::Context> native_context = i::Cast<i::Context>(context);
+    i::MathRandom::ResetContext(native_context);
+    context = native_context->next_context_link();
+  }
 }
 
 void Isolate::IncreaseHeapLimitForDebugging() {

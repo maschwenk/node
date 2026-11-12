@@ -37,6 +37,8 @@
 
 #include <cmath>
 #include <cstdlib>
+#include <atomic>
+#include <map>
 #include <optional>
 
 #include "src/base/lazy-instance.h"
@@ -173,6 +175,53 @@ int GetFlagsForMemoryPermission(OS::MemoryPermission access, PageType page_type,
   return flags;
 }
 
+#if V8_OS_LINUX && V8_ENABLE_PRIVATE_MAPPING_FORK_OPTIMIZATION
+// The ranges this process marked MADV_DONTFORK, so that an embedder that
+// forks a process with a live isolate (whose heap lives in them) can make them
+// copyable again, see MakeMappingsForkable(). Unmapped ranges are trimmed off,
+// so the set stays as small as the set of live mappings.
+std::atomic<bool> g_mappings_forkable{false};
+LazyMutex g_dontfork_mutex = LAZY_MUTEX_INITIALIZER;
+std::map<uintptr_t, uintptr_t>* g_dontfork_ranges = nullptr;  // start -> end
+
+void MarkDontFork(void* address, size_t size) {
+  if (g_mappings_forkable.load(std::memory_order_relaxed)) return;
+  MutexGuard guard(g_dontfork_mutex.Pointer());
+  if (g_mappings_forkable.load(std::memory_order_relaxed)) return;
+  // This is advisory, so we ignore errors.
+  madvise(address, size, MADV_DONTFORK);
+  if (g_dontfork_ranges == nullptr) {
+    g_dontfork_ranges = new std::map<uintptr_t, uintptr_t>();
+  }
+  const uintptr_t start = reinterpret_cast<uintptr_t>(address);
+  (*g_dontfork_ranges)[start] = start + size;
+}
+
+void ForgetDontFork(void* address, size_t size) {
+  if (g_mappings_forkable.load(std::memory_order_relaxed)) return;
+  MutexGuard guard(g_dontfork_mutex.Pointer());
+  if (g_dontfork_ranges == nullptr) return;
+  const uintptr_t start = reinterpret_cast<uintptr_t>(address);
+  const uintptr_t end = start + size;
+  auto it = g_dontfork_ranges->upper_bound(start);
+  if (it != g_dontfork_ranges->begin()) --it;
+  while (it != g_dontfork_ranges->end() && it->first < end) {
+    const uintptr_t range_start = it->first;
+    const uintptr_t range_end = it->second;
+    if (range_end <= start) {
+      ++it;
+      continue;
+    }
+    it = g_dontfork_ranges->erase(it);
+    if (range_start < start) (*g_dontfork_ranges)[range_start] = start;
+    if (range_end > end) (*g_dontfork_ranges)[end] = range_end;
+  }
+}
+#else
+void MarkDontFork(void* address, size_t size) {}
+void ForgetDontFork(void* address, size_t size) {}
+#endif  // V8_OS_LINUX && V8_ENABLE_PRIVATE_MAPPING_FORK_OPTIMIZATION
+
 void* Allocate(void* hint, size_t size, OS::MemoryPermission access,
                PageType page_type,
                std::optional<SharedMemoryHandle> handle = std::nullopt,
@@ -190,10 +239,7 @@ void* Allocate(void* hint, size_t size, OS::MemoryPermission access,
   void* result = mmap(hint, size, prot, flags, fd, kMmapFdOffset);
   if (result == MAP_FAILED) return nullptr;
 
-#if V8_OS_LINUX && V8_ENABLE_PRIVATE_MAPPING_FORK_OPTIMIZATION
-  // This is advisory, so we ignore errors.
-  madvise(result, size, MADV_DONTFORK);
-#endif
+  MarkDontFork(result, size);
 
 #if ENABLE_HUGEPAGE
   if (result != nullptr && size >= kHugePageSize) {
@@ -216,6 +262,26 @@ void* Allocate(void* hint, size_t size, OS::MemoryPermission access,
 #endif  // !V8_OS_FUCHSIA && !V8_OS_ZOS
 
 }  // namespace
+
+// Experimental, see v8::MakeMappingsForkable() in include/v8-fork.h: clears
+// MADV_DONTFORK on everything this process marked so far and stops marking
+// new mappings. Irreversible.
+void MakeMappingsForkable() {
+#if V8_OS_LINUX && V8_ENABLE_PRIVATE_MAPPING_FORK_OPTIMIZATION
+  if (g_mappings_forkable.load(std::memory_order_acquire)) return;
+  MutexGuard guard(g_dontfork_mutex.Pointer());
+  if (g_mappings_forkable.load(std::memory_order_relaxed)) return;
+  if (g_dontfork_ranges != nullptr) {
+    for (const auto& [start, end] : *g_dontfork_ranges) {
+      // Advisory; a range that was replaced by another mapping only fails.
+      madvise(reinterpret_cast<void*>(start), end - start, MADV_DOFORK);
+    }
+    delete g_dontfork_ranges;
+    g_dontfork_ranges = nullptr;
+  }
+  g_mappings_forkable.store(true, std::memory_order_release);
+#endif  // V8_OS_LINUX && V8_ENABLE_PRIVATE_MAPPING_FORK_OPTIMIZATION
+}
 
 // TODO(v8:10026): Add the right permission flag to make executable pages
 // guarded.
@@ -531,6 +597,7 @@ void* OS::AllocateShared(size_t size, MemoryPermission access) {
 void OS::Free(void* address, size_t size) {
   DCHECK_EQ(0, reinterpret_cast<uintptr_t>(address) % AllocatePageSize());
   DCHECK_EQ(0, size % AllocatePageSize());
+  ForgetDontFork(address, size);
   CHECK_EQ(0, munmap(address, size));
 }
 
@@ -551,6 +618,7 @@ void* OS::AllocateShared(void* hint, size_t size, MemoryPermission access,
 // static
 void OS::FreeShared(void* address, size_t size) {
   DCHECK_EQ(0, size % AllocatePageSize());
+  ForgetDontFork(address, size);
   CHECK_EQ(0, munmap(address, size));
 }
 
@@ -558,6 +626,7 @@ void OS::FreeShared(void* address, size_t size) {
 void OS::Release(void* address, size_t size) {
   DCHECK_EQ(0, reinterpret_cast<uintptr_t>(address) % CommitPageSize());
   DCHECK_EQ(0, size % CommitPageSize());
+  ForgetDontFork(address, size);
   CHECK_EQ(0, munmap(address, size));
 }
 
