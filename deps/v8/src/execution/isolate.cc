@@ -6375,6 +6375,7 @@ std::unique_ptr<PersistentHandles> Isolate::NewPersistentHandles() {
 }
 
 void Isolate::DumpAndResetStats() {
+  if (v8_flags.turbo_profiling_output) DumpAndResetBuiltinsProfileData();
   if (v8_flags.trace_turbo_stack_accesses) {
     StdoutStream os;
     uint64_t total_loads = 0;
