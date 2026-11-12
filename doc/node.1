@@ -2058,6 +2058,17 @@ Any other value will result in colorized output being disabled.
 Enable the module compile cache for the Node.js instance. See the documentation of
 module compile cache for details.
 .
+.It Ev NODE_COMPILE_CACHE_CAPTURE Ar compile
+When set to \fBcompile\fR, the module compile cache produces the code cache of
+a module right after it is compiled instead of after it ran. The cache then
+only holds the module's top-level code.
+.
+.It Ev NODE_COMPILE_CACHE_CHECKPOINT_GCS Ar n
+The number of major garbage collections after which a module's code cache is
+produced and written to disk while the process is still running (default: 2).
+0 turns this off, so that the cache is only produced at exit or by
+module.flushCompileCache().
+.
 .It Ev NODE_COMPILE_CACHE_PORTABLE Ar 1
 When set to 1, the module compile cache can be reused across different directory
 locations as long as the module layout relative to the cache directory remains the same,
@@ -2066,6 +2077,13 @@ and by any user (the cache subdirectory is not suffixed with the creating user's
 .It Ev NODE_COMPILE_CACHE_READONLY Ar 1
 When set to 1, the module compile cache only reads existing entries from
 its directory: nothing is written to it and it is not created if missing.
+.
+.It Ev NODE_COMPILE_CACHE_REFRESH Ar n
+For a module whose cache was read from disk and accepted, the module compile
+cache produces a new code cache after execution, so that the cache grows when a
+run exercises code that earlier runs did not. Each process does this for a
+different one in n of those modules (default: 8); 1 does it for every module
+and 0 turns it off.
 .
 .It Ev NODE_DEBUG Ar module[,…]
 \fB','\fR-separated list of core modules that should print debug information.
