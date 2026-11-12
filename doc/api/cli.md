@@ -4038,6 +4038,20 @@ changes:
 Enable the [module compile cache][] for the Node.js instance. See the documentation of
 [module compile cache][] for details.
 
+### `NODE_COMPILE_CACHE_CAPTURE=compile`
+
+When set to `compile`, the [module compile cache][] produces the code cache of
+a module right after it is compiled instead of after it ran. The cache then
+only holds the module's top-level code. With any other value, or when not set,
+the cache is produced after the code ran.
+
+### `NODE_COMPILE_CACHE_CHECKPOINT_GCS=n`
+
+The number of major garbage collections after which a module's code cache is
+produced and written to disk while the process is still running (default: 2).
+`0` turns this off, so that the cache is only produced at exit or by
+`module.flushCompileCache()`.
+
 ### `NODE_COMPILE_CACHE_PORTABLE=1`
 
 When set to 1, the [module compile cache][] can be reused across different directory
@@ -4052,6 +4066,13 @@ added: v26.8.0
 
 When set to 1, the [module compile cache][] only reads existing entries from
 its directory: nothing is written to it and it is not created if missing.
+
+### `NODE_COMPILE_CACHE_REFRESH=0`
+
+When set to 0, the [module compile cache][] does not produce a new code cache
+for a module whose cache was read from disk and accepted, so caches no longer
+grow with the code that later runs exercise. This avoids the cost of producing
+the cache on every run once caches are known to be complete.
 
 ### `NODE_DEBUG=module[,…]`
 

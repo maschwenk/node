@@ -387,12 +387,31 @@ The enabled module compile cache can be disabled by the [`NODE_DISABLE_COMPILE_C
 environment variable. This can be useful when the compile cache leads to unexpected or
 undesired behaviors (e.g. less precise test coverage).
 
-At the moment, when the compile cache is enabled and a module is loaded afresh, the
-code cache is generated from the compiled code immediately, but will only be written
-to disk when the Node.js instance is about to exit. This is subject to change. The
-[`module.flushCompileCache()`][] method can be used to ensure the accumulated code cache
-is flushed to disk in case the application wants to spawn other Node.js instances
-and let them share the cache long before the parent exits.
+### When the compile cache is produced
+
+V8 compiles functions lazily, when they are first called, so a code cache
+produced right after a module is compiled would only contain its top-level
+code. Node.js produces the code cache of a module after it ran instead, so
+that it also contains the functions that were called:
+
+* a few major garbage collections after the module was compiled, at which
+  point the cache is also written to disk (V8 discards the compiled code of
+  functions that have not run for a while, so waiting until exit in a
+  long-running process would lose most of it), and
+* again when the Node.js instance is about to exit, or when
+  [`module.flushCompileCache()`][] is called.
+
+A cache on disk is only replaced by a larger one, so a cache produced by a run
+that exercised less code grows when a later run exercises more, and is not
+rewritten when nothing changed. A process that is killed by a signal does not
+run its exit handlers; the cache it wrote at the earlier point is kept.
+
+The [`module.flushCompileCache()`][] method can be used to write the cache at a
+point the application chooses, for example once a server has started, or before
+spawning other Node.js instances that should share the cache.
+
+[`NODE_COMPILE_CACHE_CAPTURE=compile`][] restores producing the cache right
+after compilation.
 
 The compile cache layout on disk is an implementation detail and should not be
 relied upon. The compile cache generated is typically only reusable in the same
@@ -2067,6 +2086,7 @@ returned object contains the following keys:
 [`--import`]: cli.md#--importmodule
 [`--require`]: cli.md#-r---require-module
 [`NODE_COMPILE_CACHE=dir`]: cli.md#node_compile_cachedir
+[`NODE_COMPILE_CACHE_CAPTURE=compile`]: cli.md#node_compile_cache_capturecompile
 [`NODE_COMPILE_CACHE_PORTABLE=1`]: cli.md#node_compile_cache_portable1
 [`NODE_COMPILE_CACHE_READONLY=1`]: cli.md#node_compile_cache_readonly1
 [`NODE_DISABLE_COMPILE_CACHE=1`]: cli.md#node_disable_compile_cache1
