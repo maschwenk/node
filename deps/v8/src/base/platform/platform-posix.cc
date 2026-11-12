@@ -185,11 +185,13 @@ LazyMutex g_dontfork_mutex = LAZY_MUTEX_INITIALIZER;
 std::map<uintptr_t, uintptr_t>* g_dontfork_ranges = nullptr;  // start -> end
 
 void MarkDontFork(void* address, size_t size) {
-  if (g_mappings_forkable.load(std::memory_order_relaxed)) return;
   MutexGuard guard(g_dontfork_mutex.Pointer());
-  if (g_mappings_forkable.load(std::memory_order_relaxed)) return;
-  // This is advisory, so we ignore errors.
-  madvise(address, size, MADV_DONTFORK);
+  // While the mappings are forkable (see MakeMappingsForkable()), new ones
+  // are only recorded; MakeMappingsUnforkable() marks them later.
+  if (!g_mappings_forkable.load(std::memory_order_relaxed)) {
+    // This is advisory, so we ignore errors.
+    madvise(address, size, MADV_DONTFORK);
+  }
   if (g_dontfork_ranges == nullptr) {
     g_dontfork_ranges = new std::map<uintptr_t, uintptr_t>();
   }
@@ -198,7 +200,6 @@ void MarkDontFork(void* address, size_t size) {
 }
 
 void ForgetDontFork(void* address, size_t size) {
-  if (g_mappings_forkable.load(std::memory_order_relaxed)) return;
   MutexGuard guard(g_dontfork_mutex.Pointer());
   if (g_dontfork_ranges == nullptr) return;
   const uintptr_t start = reinterpret_cast<uintptr_t>(address);
@@ -263,24 +264,35 @@ void* Allocate(void* hint, size_t size, OS::MemoryPermission access,
 
 }  // namespace
 
-// Experimental, see v8::MakeMappingsForkable() in include/v8-fork.h: clears
-// MADV_DONTFORK on everything this process marked so far and stops marking
-// new mappings. Irreversible.
-void MakeMappingsForkable() {
+// Experimental, see include/v8-fork.h. Switch V8's mappings between copied by
+// fork(2) (needed by a forked child that keeps using the isolate) and
+// MADV_DONTFORK (cheap fork+exec).
 #if V8_OS_LINUX && V8_ENABLE_PRIVATE_MAPPING_FORK_OPTIMIZATION
-  if (g_mappings_forkable.load(std::memory_order_acquire)) return;
+static void SetMappingsForkable(bool forkable) {
+  if (g_mappings_forkable.load(std::memory_order_acquire) == forkable) return;
   MutexGuard guard(g_dontfork_mutex.Pointer());
-  if (g_mappings_forkable.load(std::memory_order_relaxed)) return;
+  if (g_mappings_forkable.load(std::memory_order_relaxed) == forkable) return;
   if (g_dontfork_ranges != nullptr) {
     for (const auto& [start, end] : *g_dontfork_ranges) {
-      // Advisory; a range that was replaced by another mapping only fails.
-      madvise(reinterpret_cast<void*>(start), end - start, MADV_DOFORK);
+      // Advisory; a range that is not entirely mapped any more only fails.
+      madvise(reinterpret_cast<void*>(start), end - start,
+              forkable ? MADV_DOFORK : MADV_DONTFORK);
     }
-    delete g_dontfork_ranges;
-    g_dontfork_ranges = nullptr;
   }
-  g_mappings_forkable.store(true, std::memory_order_release);
+  g_mappings_forkable.store(forkable, std::memory_order_release);
+}
 #endif  // V8_OS_LINUX && V8_ENABLE_PRIVATE_MAPPING_FORK_OPTIMIZATION
+
+void MakeMappingsForkable() {
+#if V8_OS_LINUX && V8_ENABLE_PRIVATE_MAPPING_FORK_OPTIMIZATION
+  SetMappingsForkable(true);
+#endif
+}
+
+void MakeMappingsUnforkable() {
+#if V8_OS_LINUX && V8_ENABLE_PRIVATE_MAPPING_FORK_OPTIMIZATION
+  SetMappingsForkable(false);
+#endif
 }
 
 // TODO(v8:10026): Add the right permission flag to make executable pages

@@ -10731,6 +10731,7 @@ void Isolate::Freeze(bool is_frozen) {
 namespace base {
 // Defined in src/base/platform/platform-posix.cc.
 void MakeMappingsForkable();
+void MakeMappingsUnforkable();
 }  // namespace base
 #endif
 
@@ -10739,6 +10740,19 @@ void MakeMappingsForkable() {
   base::MakeMappingsForkable();
 #endif
 }
+
+void MakeMappingsUnforkable() {
+#if V8_OS_POSIX
+  base::MakeMappingsUnforkable();
+#endif
+}
+
+namespace internal {
+// Defined in src/logging/log.cc.
+void ReopenPerfBasicLogAfterFork();
+}  // namespace internal
+
+void ReopenPerfMapAfterFork() { i::ReopenPerfBasicLogAfterFork(); }
 
 void ReseedRandomNumberGeneratorsAfterFork(Isolate* isolate) {
   i::Isolate* i_isolate = reinterpret_cast<i::Isolate*>(isolate);
