@@ -14,6 +14,13 @@ namespace node {
 // exits and is safe to use from any thread.
 v8::PageAllocator* GetHeapPageAllocatorFromEnvironment();
 
+// With NODE_TEXT_HUGEPAGES=builtins, copies the 2 MiB-aligned part of Node's
+// executable text that holds V8's embedded builtins into anonymous huge pages
+// mapped at the same addresses; with NODE_TEXT_HUGEPAGES=all, all of the
+// 2 MiB-aligned text. Does nothing otherwise. Only the first call per process
+// does anything.
+void MaybeRemapTextToHugePages(v8::Isolate* isolate);
+
 }  // namespace node
 
 #endif  // defined(NODE_WANT_INTERNALS) && NODE_WANT_INTERNALS

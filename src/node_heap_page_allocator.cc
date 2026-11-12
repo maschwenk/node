@@ -44,6 +44,7 @@
 #include <sys/mman.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cerrno>
 #include <cinttypes>
@@ -697,8 +698,121 @@ HeapPageAllocator* CreateFromEnvironment() {
   return allocator;
 }
 
+// Executable text is mapped from the binary in 4 KiB pages (file-backed text
+// can only get huge pages with CONFIG_READ_ONLY_THP_FOR_FS). This copies the
+// chosen 2 MiB-aligned window into an anonymous MADV_HUGEPAGE mapping and moves
+// that mapping over the original with mremap(), which swaps it atomically.
+// The bytes are identical, so threads running in the window are unaffected.
+void RemapText(v8::Isolate* isolate) {
+  std::string mode;
+  if (!credentials::SafeGetenv("NODE_TEXT_HUGEPAGES", &mode) || mode.empty() ||
+      mode == "0") {
+    return;
+  }
+  if (mode != "builtins" && mode != "all") {
+    fprintf(stderr,
+            "node: ignoring NODE_TEXT_HUGEPAGES=%s (expected builtins or all)\n",
+            mode.c_str());
+    return;
+  }
+  const void* code = nullptr;
+  size_t code_size = 0;
+  isolate->GetEmbeddedCodeRange(&code, &code_size);
+  uintptr_t code_start = reinterpret_cast<uintptr_t>(code);
+  uintptr_t code_end = code_start + code_size;
+  if (code_start == 0) return;
+
+  // The executable mapping that holds the builtins.
+  uintptr_t text_start = 0, text_end = 0;
+  FILE* maps = fopen("/proc/self/maps", "r");
+  if (maps == nullptr) return;
+  char line[512];
+  while (fgets(line, sizeof(line), maps) != nullptr) {
+    uintptr_t lo, hi;
+    char perms[5];
+    if (sscanf(line, "%" SCNxPTR "-%" SCNxPTR " %4s", &lo, &hi, perms) != 3) {
+      continue;
+    }
+    if (perms[2] == 'x' && lo <= code_start && code_start < hi) {
+      text_start = lo;
+      text_end = hi;
+      break;
+    }
+  }
+  fclose(maps);
+  if (text_start == 0) return;
+
+  auto round_up = [](uintptr_t value) {
+    return (value + kRegionSize - 1) & ~(kRegionSize - 1);
+  };
+  auto round_down = [](uintptr_t value) { return value & ~(kRegionSize - 1); };
+  uintptr_t start = round_up(text_start);
+  uintptr_t end = round_down(text_end);
+  if (mode == "builtins") {
+    start = std::max(start, round_down(code_start));
+    end = std::min(end, round_up(code_end));
+  }
+  if (end <= start) return;
+  size_t size = end - start;
+
+  void* raw = mmap(nullptr,
+                   size + kRegionSize,
+                   PROT_READ | PROT_WRITE,
+                   MAP_PRIVATE | MAP_ANONYMOUS,
+                   -1,
+                   0);
+  if (raw == MAP_FAILED) return;
+  uintptr_t raw_start = reinterpret_cast<uintptr_t>(raw);
+  uintptr_t copy = round_up(raw_start);
+  if (copy != raw_start) munmap(raw, copy - raw_start);
+  uintptr_t raw_end = raw_start + size + kRegionSize;
+  if (raw_end != copy + size) {
+    munmap(reinterpret_cast<void*>(copy + size), raw_end - (copy + size));
+  }
+  void* copy_address = reinterpret_cast<void*>(copy);
+  madvise(copy_address, size, MADV_HUGEPAGE);
+  memcpy(copy_address, reinterpret_cast<void*>(start), size);
+  __builtin___clear_cache(static_cast<char*>(copy_address),
+                          static_cast<char*>(copy_address) + size);
+  if (mprotect(copy_address, size, PROT_READ | PROT_EXEC) != 0 ||
+      mremap(copy_address,
+             size,
+             size,
+             MREMAP_MAYMOVE | MREMAP_FIXED,
+             reinterpret_cast<void*>(start)) == MAP_FAILED) {
+    fprintf(stderr,
+            "node: NODE_TEXT_HUGEPAGES: could not remap text: %s\n",
+            strerror(errno));
+    munmap(copy_address, size);
+    return;
+  }
+  std::string stats_dir;
+  if (credentials::SafeGetenv("NODE_HEAP_HUGEPAGES_STATS", &stats_dir) &&
+      !stats_dir.empty()) {
+    std::string path =
+        stats_dir + "/text-" + std::to_string(getpid()) + ".txt";
+    FILE* file = fopen(path.c_str(), "w");
+    if (file != nullptr) {
+      fprintf(file,
+              "mode %s text %zu MiB builtins %zu KiB remapped %zu MiB\n",
+              mode.c_str(),
+              static_cast<size_t>(text_end - text_start) >> 20,
+              code_size >> 10,
+              size >> 20);
+      fclose(file);
+    }
+  }
+}
+
 }  // namespace
 #endif  // defined(__linux__)
+
+void MaybeRemapTextToHugePages(v8::Isolate* isolate) {
+#if defined(__linux__)
+  static std::once_flag once;
+  std::call_once(once, [isolate]() { RemapText(isolate); });
+#endif
+}
 
 v8::PageAllocator* GetHeapPageAllocatorFromEnvironment() {
 #if defined(__linux__)
