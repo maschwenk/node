@@ -10,8 +10,20 @@ if (typeof process.forkSelf !== 'function') {
 
 const assert = require('assert');
 const fs = require('fs');
+const { spawnSync } = require('child_process');
 const { Worker } = require('worker_threads');
 const { forkChild, expectCleanExit } = require('../common/fork-self');
+
+if (process.argv[2] === 'cpu-prof') {
+  // V8's CPU profiler runs a sampling thread that forkSelf() does not know.
+  try {
+    process.forkSelf();
+    console.log('forked');
+  } catch (err) {
+    console.log(`${err.code} ${err.message}`);
+  }
+  return;
+}
 
 // Options are validated.
 assert.throws(() => process.forkSelf(1), { code: 'ERR_INVALID_ARG_TYPE' });
@@ -50,6 +62,19 @@ w.on('message', common.mustCall((type) => {
       message: /inspector is listening/,
     });
     inspector.close();
+  }
+
+  // While a thread it does not know runs (Linux: it lists the process's
+  // threads), here V8's CPU profiler's.
+  if (common.isLinux) {
+    const tmpdir = require('../common/tmpdir');
+    tmpdir.refresh();
+    const r = spawnSync(process.execPath,
+                        ['--cpu-prof', '--cpu-prof-dir', tmpdir.path,
+                         __filename, 'cpu-prof']);
+    assert.strictEqual(r.status, 0, r.stderr.toString());
+    assert.match(r.stdout.toString(),
+                 /^ERR_FORK_SELF_UNSAFE .*threads it does not know .*\(\d+\)/);
   }
 
   // Everything works again once the condition is gone, in both processes.
